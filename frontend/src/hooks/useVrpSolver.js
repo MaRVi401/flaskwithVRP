@@ -64,6 +64,7 @@ export function useVrpSolver() {
 
     setIsCalculating(true);
     setError(null);
+    const startTime = Date.now();
 
     try {
       const response = await fetch(`${API_BASE_URL}/solve`, {
@@ -83,6 +84,12 @@ export function useVrpSolver() {
 
       if (!response.ok || payload.status !== 'SUCCESS') {
         throw new Error(payload.message || `Server error: ${response.status}`);
+      }
+
+      // Jeda minimal 900ms agar modal tahapan progres terlihat mulus dan informatif
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 900) {
+        await new Promise((resolve) => setTimeout(resolve, 900 - elapsed));
       }
 
       if (payload.isBenchmark) {

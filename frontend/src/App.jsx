@@ -87,6 +87,7 @@ export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [showTradeOff, setShowTradeOff] = useState(false);
   const [benchmarkView, setBenchmarkView] = useState("table"); // 'table' | 'chart'
+  const [singleView, setSingleView] = useState("chart"); // 'chart' | 'log'
   const [isRouteOutdated, setIsRouteOutdated] = useState(false);
   const [mobileTab, setMobileTab] = useState("result"); // 'result' | 'locations' | 'params'
 
@@ -99,7 +100,14 @@ export default function App() {
   });
 
   const [editingLoc, setEditingLoc] = useState(null);
-  const { isCalculating, result, benchmarkResult, runSolver } = useVrpSolver();
+  const {
+    isCalculating,
+    isLoadingDataset,
+    result,
+    benchmarkResult,
+    runSolver,
+    loadDatasetFromApi,
+  } = useVrpSolver();
 
   useEffect(() => {
     if (isDarkMode) {
@@ -149,6 +157,20 @@ export default function App() {
     setBenchmarkView("table");
     setMobileTab("result");
     runSolver(algorithm, locations, params);
+  };
+
+  const handleLoadBackendDataset = async () => {
+    const datasetLocations = await loadDatasetFromApi();
+    if (datasetLocations && datasetLocations.length > 0) {
+      updateLocations(datasetLocations);
+      if (params.capacity * params.vehicles < 250) {
+        updateParams({
+          ...params,
+          capacity: 100,
+          vehicles: 4,
+        });
+      }
+    }
   };
 
   const handleMapClick = (latlng) => {
@@ -295,7 +317,6 @@ export default function App() {
           return;
         }
 
-        // Pastikan hanya ada tepat 1 depot
         let depotAssigned = false;
         parsed = parsed.map((item) => {
           if (item.isDepot && !depotAssigned) {
@@ -330,6 +351,7 @@ export default function App() {
       totalDistanceKm: Number(activeResult.bestDistance.toFixed(2)),
       executionTimeMs: activeResult.executionTime || activeResult.time,
       isFeasible: activeResult.isFeasible,
+      metrics: activeResult.metrics || null,
       routes: activeResult.bestRoutes.map((r, idx) => ({
         armada: idx + 1,
         load: r.reduce((sum, cIdx) => sum + (locations[cIdx]?.demand || 0), 0),
@@ -475,13 +497,6 @@ export default function App() {
                 locations={locations}
                 routes={activeResult ? activeResult.bestRoutes : []}
                 onMapClick={handleMapClick}
-              />
-              <CalculationOverlay
-                isCalculating={isCalculating}
-                algorithm={algorithm}
-                params={params}
-                locationCount={locations.length}
-                isDarkMode={isDarkMode}
               />
             </div>
             <div className="mt-1.5 px-1 flex justify-between items-center text-[10px] opacity-65">
@@ -640,6 +655,14 @@ export default function App() {
                           <span>•</span>
                           <i className="ti ti-truck text-xs"></i>
                           <span>{activeResult.bestRoutes.length} Armada</span>
+                          {activeResult.metrics?.reductionPct > 0 && (
+                            <>
+                              <span>•</span>
+                              <span className="text-emerald-500 font-bold">
+                                -{activeResult.metrics.reductionPct}%
+                              </span>
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -725,7 +748,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Grafik Konvergensi / Tabel Benchmark */}
+            {/* Grafik Konvergensi / Tabel Benchmark / Log Iterasi */}
             <div className="w-full md:w-7/12 h-48 md:h-full flex flex-col min-h-0 overflow-hidden">
               {activeBenchmark ? (
                 <div className="h-full flex flex-col min-h-0">
@@ -775,8 +798,8 @@ export default function App() {
                           <tr>
                             <th className="p-1.5">Algoritma</th>
                             <th className="p-1.5">Total Jarak</th>
+                            <th className="p-1.5">Reduksi</th>
                             <th className="p-1.5">Waktu</th>
-                            <th className="p-1.5">Armada</th>
                             <th className="p-1.5">Status</th>
                           </tr>
                         </thead>
@@ -805,10 +828,10 @@ export default function App() {
                                 <td className="p-1.5 font-bold">
                                   {d.bestDistance.toFixed(2)} km
                                 </td>
-                                <td className="p-1.5">{d.time} ms</td>
-                                <td className="p-1.5">
-                                  {d.bestRoutes.length} Unit
+                                <td className="p-1.5 text-emerald-500 font-bold">
+                                  -{d.metrics?.reductionPct ?? 0}%
                                 </td>
+                                <td className="p-1.5">{d.time} ms</td>
                                 <td className="p-1.5">
                                   {d.isFeasible === false ? (
                                     <span className="text-rose-500 font-bold inline-flex items-center gap-0.5">
@@ -839,16 +862,160 @@ export default function App() {
                 </div>
               ) : (
                 <div className="h-full flex flex-col min-h-0">
-                  <h3 className="text-xs font-bold uppercase tracking-wider mb-1 opacity-80 flex items-center gap-1.5">
-                    <i className="ti ti-chart-line text-indigo-500 text-sm"></i>
-                    <span>Kurva Konvergensi Fitness</span>
-                  </h3>
-                  <div className="flex-1 min-h-0 w-full">
-                    <FitnessChart
-                      historyData={activeResult ? activeResult.history : []}
-                      isDarkMode={isDarkMode}
-                    />
+                  <div className="flex items-center justify-between mb-1.5 shrink-0 gap-2">
+                    <h3 className="text-xs font-bold uppercase tracking-wider opacity-80 flex items-center gap-1.5 truncate">
+                      <i className="ti ti-chart-line text-indigo-500 text-sm"></i>
+                      <span>
+                        {singleView === "chart"
+                          ? "Kurva Konvergensi Fitness"
+                          : "Efektivitas & Log Iterasi"}
+                      </span>
+                    </h3>
+
+                    {activeResult && (
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => setSingleView("chart")}
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
+                            singleView === "chart"
+                              ? "bg-indigo-600 text-white"
+                              : isDarkMode
+                                ? "bg-slate-700 text-slate-300"
+                                : "bg-slate-100 text-slate-600"
+                          }`}
+                        >
+                          Kurva
+                        </button>
+                        <button
+                          onClick={() => setSingleView("log")}
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
+                            singleView === "log"
+                              ? "bg-indigo-600 text-white"
+                              : isDarkMode
+                                ? "bg-slate-700 text-slate-300"
+                                : "bg-slate-100 text-slate-600"
+                          }`}
+                        >
+                          Log & Efektivitas
+                        </button>
+                      </div>
+                    )}
                   </div>
+
+                  {singleView === "log" && activeResult ? (
+                    <div className="flex-1 flex flex-col min-h-0 gap-1.5 text-[11px]">
+                      {/* Kartu Ringkasan Efektivitas & Splitting */}
+                      <div
+                        className={`grid grid-cols-3 gap-1.5 p-2 rounded-lg border shrink-0 ${
+                          isDarkMode
+                            ? "bg-slate-900/90 border-slate-700"
+                            : "bg-indigo-50/60 border-indigo-200/80"
+                        }`}
+                      >
+                        <div>
+                          <div className="text-[9px] opacity-65 uppercase">
+                            Efektivitas Jarak
+                          </div>
+                          <div className="font-black text-emerald-500">
+                            -{activeResult.metrics?.reductionPct ?? 0}% (
+                            {activeResult.metrics?.initialDistance} →{" "}
+                            {activeResult.metrics?.finalDistance} km)
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[9px] opacity-65 uppercase">
+                            Fase & Splitting
+                          </div>
+                          <div className="font-bold truncate">
+                            {activeResult.metrics?.phaseSplit ||
+                              `${params.generations} Gen • Split Prins DP`}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[9px] opacity-65 uppercase">
+                            Pergerakan Solusi
+                          </div>
+                          <div className="font-bold">
+                            {activeResult.metrics?.improvementSteps ?? 0}x
+                            Update • {activeResult.metrics?.totalEvaluations ?? 0}{" "}
+                            Eval
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Tabel Log Pergerakan Tiap Generasi */}
+                      <div
+                        className={`flex-1 overflow-y-auto border rounded-lg ${
+                          isDarkMode ? "border-slate-700" : "border-slate-200"
+                        }`}
+                      >
+                        <table className="w-full text-left text-[10px]">
+                          <thead
+                            className={`uppercase sticky top-0 ${
+                              isDarkMode
+                                ? "bg-slate-900 text-slate-400"
+                                : "bg-slate-100 text-slate-600"
+                            }`}
+                          >
+                            <tr>
+                              <th className="p-1.5">Iterasi</th>
+                              <th className="p-1.5">Fase Pencarian</th>
+                              <th className="p-1.5">Jarak Terbaik</th>
+                              <th className="p-1.5">Delta</th>
+                            </tr>
+                          </thead>
+                          <tbody
+                            className={`divide-y ${
+                              isDarkMode
+                                ? "divide-slate-800"
+                                : "divide-slate-200"
+                            }`}
+                          >
+                            {(activeResult.history || []).map((item, idx, arr) => {
+                              const prevFit =
+                                idx > 0 ? arr[idx - 1].fitness : item.fitness;
+                              const diff = Number(
+                                (item.fitness - prevFit).toFixed(2),
+                              );
+                              return (
+                                <tr key={item.generation}>
+                                  <td className="p-1.5 font-mono font-bold">
+                                    Gen #{item.generation}
+                                  </td>
+                                  <td className="p-1.5 opacity-80">
+                                    {item.phase ||
+                                      (item.generation <=
+                                      Math.floor(params.generations * 0.6)
+                                        ? "GA Exploration"
+                                        : "ABC Exploitation")}
+                                  </td>
+                                  <td className="p-1.5 font-bold text-indigo-500">
+                                    {item.fitness} km
+                                  </td>
+                                  <td className="p-1.5 font-semibold">
+                                    {diff < 0 ? (
+                                      <span className="text-emerald-500">
+                                        {diff} km
+                                      </span>
+                                    ) : (
+                                      <span className="opacity-45">0.00 km</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex-1 min-h-0 w-full">
+                      <FitnessChart
+                        historyData={activeResult ? activeResult.history : []}
+                        isDarkMode={isDarkMode}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -863,25 +1030,44 @@ export default function App() {
               mobileTab === "params" ? "block" : "hidden lg:block"
             } p-3 rounded-xl shadow-sm border shrink-0 space-y-2.5 transition-colors ${cardSurface}`}
           >
-            <div className="flex justify-between items-center">
+            <div className="flex justify-between items-center gap-1">
               <h2 className="text-xs font-bold uppercase tracking-wider opacity-80 flex items-center gap-1.5">
                 <i className="ti ti-adjustments-horizontal text-indigo-500 text-sm"></i>
                 <span>Konfigurasi Algoritma</span>
               </h2>
-              <input
-                type="file"
-                accept=".csv, .json"
-                onChange={handleFileUpload}
-                id="file-upload"
-                className="hidden"
-              />
-              <label
-                htmlFor="file-upload"
-                className="text-[11px] text-indigo-500 hover:underline font-bold cursor-pointer flex items-center gap-1"
-              >
-                <i className="ti ti-upload text-xs"></i>
-                <span>Import CSV/JSON</span>
-              </label>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleLoadBackendDataset}
+                  disabled={isLoadingDataset}
+                  title="Muat dataset 31 kecamatan langsung dari server Flask (/api/dataset)"
+                  className="text-[11px] text-emerald-500 hover:underline font-bold cursor-pointer flex items-center gap-1 disabled:opacity-50"
+                >
+                  <i
+                    className={`ti ${
+                      isLoadingDataset
+                        ? "ti-loader-2 animate-spin"
+                        : "ti-database-import"
+                    } text-xs`}
+                  ></i>
+                  <span>31 Kec (API)</span>
+                </button>
+                <span className="opacity-30 text-xs">|</span>
+                <input
+                  type="file"
+                  accept=".csv, .json"
+                  onChange={handleFileUpload}
+                  id="file-upload"
+                  className="hidden"
+                />
+                <label
+                  htmlFor="file-upload"
+                  className="text-[11px] text-indigo-500 hover:underline font-bold cursor-pointer flex items-center gap-1"
+                >
+                  <i className="ti ti-upload text-xs"></i>
+                  <span>Import</span>
+                </label>
+              </div>
             </div>
 
             <div className="space-y-2 text-xs">
@@ -1105,7 +1291,7 @@ export default function App() {
                         {loc.isDepot
                           ? "Pusat Distribusi"
                           : `Demand: ${loc.demand} unit`}{" "}
-                        • ({loc.lat.toFixed(4)}, {loc.lng.toFixed(4)})
+                        - ({loc.lat.toFixed(4)}, {loc.lng.toFixed(4)})
                       </div>
                     </div>
 
@@ -1196,6 +1382,15 @@ export default function App() {
           <span>{isCalculating ? "Menghitung..." : "Jalankan Optimasi"}</span>
         </button>
       </div>
+
+      {/* Modal Proses Kalkulasi Interaktif */}
+      <CalculationOverlay
+        isCalculating={isCalculating}
+        algorithm={algorithm}
+        params={params}
+        locationCount={locations.length}
+        isDarkMode={isDarkMode}
+      />
 
       {/* Modal Edit Pop-up */}
       {editingLoc && (

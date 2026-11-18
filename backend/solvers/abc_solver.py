@@ -62,8 +62,12 @@ def run_abc(
         else dict(fitness_cache[0])
     )
     history = []
+    improvement_count = 0
+    scout_resets = 0
 
     for gen in range(generations):
+        gen_improved = False
+
         # 1. Employed Bees Phase
         for i in range(pop_size):
             new_perm = mutate_route_neighborhood(food_sources[i])
@@ -134,19 +138,33 @@ def run_abc(
                     eval_cache,
                 )
                 trial_limits[i] = 0
+                scout_resets += 1
 
         # Update Global Best
         for i in range(pop_size):
             if fitness_cache[i]["fitness"] < best_eval["fitness"]:
                 best_eval = dict(fitness_cache[i])
                 best_perm = list(food_sources[i])
+                gen_improved = True
+
+        if gen_improved:
+            improvement_count += 1
 
         history.append(
             {
                 "generation": gen + 1,
                 "fitness": round(best_eval["distance"], 2),
+                "phase": "ABC Employed/Onlooker/Scout",
             }
         )
+
+    initial_dist = history[0]["fitness"] if history else best_eval["distance"]
+    final_dist = round(best_eval["distance"], 2)
+    reduction_pct = (
+        round(((initial_dist - final_dist) / initial_dist) * 100, 2)
+        if initial_dist > 0
+        else 0.0
+    )
 
     return {
         "bestRoutes": decode_chromosome(
@@ -155,4 +173,13 @@ def run_abc(
         "bestDistance": best_eval["distance"],
         "isFeasible": best_eval["isFeasible"],
         "history": history,
+        "metrics": {
+            "initialDistance": initial_dist,
+            "finalDistance": final_dist,
+            "reductionPct": max(0.0, reduction_pct),
+            "improvementSteps": improvement_count,
+            "scoutResets": scout_resets,
+            "totalEvaluations": generations * pop_size * 2,
+            "phaseSplit": f"100% ABC ({generations} Gen)",
+        },
     }

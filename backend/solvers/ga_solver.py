@@ -31,9 +31,11 @@ def run_ga(
     best_perm = list(population[0])
     best_eval = {"distance": float("inf"), "fitness": float("inf"), "isFeasible": False}
     history = []
+    improvement_count = 0
 
     for gen in range(generations):
         evaluated = []
+        gen_improved = False
         for perm in population:
             eval_res = evaluate_permutation_cached(
                 perm,
@@ -48,12 +50,17 @@ def run_ga(
             if eval_res["fitness"] < best_eval["fitness"]:
                 best_eval = eval_res
                 best_perm = list(perm)
+                gen_improved = True
             evaluated.append((eval_res["fitness"], perm))
+
+        if gen_improved:
+            improvement_count += 1
 
         history.append(
             {
                 "generation": gen + 1,
                 "fitness": round(best_eval["distance"], 2),
+                "phase": "GA Selection & Crossover",
             }
         )
 
@@ -94,6 +101,14 @@ def run_ga(
 
         population = next_pop
 
+    initial_dist = history[0]["fitness"] if history else best_eval["distance"]
+    final_dist = round(best_eval["distance"], 2)
+    reduction_pct = (
+        round(((initial_dist - final_dist) / initial_dist) * 100, 2)
+        if initial_dist > 0
+        else 0.0
+    )
+
     return {
         "bestRoutes": decode_chromosome(
             best_perm, locations, capacity, vehicles, dist_matrix, depot_idx, decode_cache
@@ -101,6 +116,14 @@ def run_ga(
         "bestDistance": best_eval["distance"],
         "isFeasible": best_eval["isFeasible"],
         "history": history,
+        "metrics": {
+            "initialDistance": initial_dist,
+            "finalDistance": final_dist,
+            "reductionPct": max(0.0, reduction_pct),
+            "improvementSteps": improvement_count,
+            "totalEvaluations": generations * pop_size,
+            "phaseSplit": f"100% GA ({generations} Gen)",
+        },
         "finalPopulation": population,
         "bestPerm": best_perm,
         "bestEval": best_eval,

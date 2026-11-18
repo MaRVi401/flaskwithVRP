@@ -344,12 +344,33 @@ def run_hybrid(
             {
                 "generation": ga_gen + i + 1,
                 "fitness": fitness_val,
+                "phase": "ABC Exploitation & Polishing",
             }
         )
+
+    initial_dist = history[0]["fitness"] if history else winner_dist_rounded
+    reduction_pct = (
+        round(((initial_dist - winner_dist_rounded) / initial_dist) * 100, 2)
+        if initial_dist > 0
+        else 0.0
+    )
+    total_improvements = (
+        ga_result.get("metrics", {}).get("improvementSteps", 0)
+        + abc_result.get("metrics", {}).get("improvementSteps", 0)
+    )
 
     return {
         "bestRoutes": winner["routes"],
         "bestDistance": winner["evalRes"]["distance"],
         "isFeasible": winner["evalRes"]["isFeasible"],
         "history": history,
+        "metrics": {
+            "initialDistance": initial_dist,
+            "finalDistance": winner_dist_rounded,
+            "reductionPct": max(0.0, reduction_pct),
+            "improvementSteps": total_improvements,
+            "scoutResets": abc_result.get("metrics", {}).get("scoutResets", 0),
+            "totalEvaluations": (ga_gen * pop_size) + (abc_gen * pop_size * 2),
+            "phaseSplit": f"60% GA ({ga_gen} Gen) + Local Search + 40% ABC ({abc_gen} Gen)",
+        },
     }
