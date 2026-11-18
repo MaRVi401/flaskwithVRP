@@ -1,3 +1,4 @@
+from solvers.cache import BoundedCache
 from solvers.distance import get_single_route_distance
 from solvers.split_prins import (
     decode_chromosome,
@@ -212,9 +213,9 @@ def run_hybrid(
     vehicles = int(params["vehicles"])
 
     if decode_cache is None:
-        decode_cache = {}
+        decode_cache = BoundedCache()
     if eval_cache is None:
-        eval_cache = {}
+        eval_cache = BoundedCache()
 
     ga_gen = max(1, int(generations * 0.6))
     abc_gen = max(1, generations - ga_gen)
@@ -329,17 +330,15 @@ def run_hybrid(
     candidates.sort(key=lambda x: x["evalRes"]["fitness"])
     winner = candidates[0]
 
-    refined_ga_dist_rounded = round(refined_ga_eval["distance"], 2)
     winner_dist_rounded = round(winner["evalRes"]["distance"], 2)
 
+    # Riwayat jujur: populasi ABC sudah diseed dengan solusi GA yang di-refine,
+    # jadi kurvanya tidak perlu dimanipulasi. Hanya titik terakhir diganti dengan
+    # hasil akhir setelah polishing (local search pada solusi ABC).
     history = list(ga_result["history"])
     abc_hist_len = len(abc_result["history"])
     for i, h in enumerate(abc_result["history"]):
-        fitness_val = (
-            winner_dist_rounded
-            if i == abc_hist_len - 1
-            else min(h["fitness"], refined_ga_dist_rounded)
-        )
+        fitness_val = winner_dist_rounded if i == abc_hist_len - 1 else h["fitness"]
         history.append(
             {
                 "generation": ga_gen + i + 1,
@@ -371,6 +370,7 @@ def run_hybrid(
             "improvementSteps": total_improvements,
             "scoutResets": abc_result.get("metrics", {}).get("scoutResets", 0),
             "totalEvaluations": (ga_gen * pop_size) + (abc_gen * pop_size * 2),
+            "uniqueEvaluations": getattr(eval_cache, "misses", None),
             "phaseSplit": f"60% GA ({ga_gen} Gen) + Local Search + 40% ABC ({abc_gen} Gen)",
         },
     }

@@ -1,4 +1,5 @@
 import random
+from solvers.cache import count_miss
 from solvers.distance import get_single_route_distance
 
 OVERLOAD_PENALTY = 1000.0
@@ -32,27 +33,73 @@ def evaluate_solution(
     }
 
 
-def decode_chromosome(
-    permutation: list,
-    locations: list,
-    vehicle_capacity: float,
-    num_vehicles: int,
-    dist_matrix: list,
-    depot_idx: int,
-    cache: dict = None,
-) -> list:
-    """Algoritma Split Prins (Dynamic Programming) dengan Memoization Cache."""
+def _split_bounded(permutation, demands, dist_matrix, depot_idx, capacity, num_vehicles):
+    """Split Prins hanya dengan segmen yang tidak melampaui kapasitas.
+
+    Segmen diperluas sampai muatan melebihi kapasitas lalu berhenti, sehingga
+    jumlah segmen yang dihitung jauh lebih sedikit daripada versi penuh O(m^2).
+    Mengembalikan None bila tidak ada solusi dengan <= num_vehicles rute.
+    """
     m = len(permutation)
-    if num_vehicles <= 0 or m == 0:
-        return []
+    inf = float("inf")
+    depot_row = dist_matrix[depot_idx]
 
-    perm_key = tuple(permutation)
-    if cache is not None and perm_key in cache:
-        return [list(r) for r in cache[perm_key]]
+    segments = []
+    for i in range(m):
+        load = 0.0
+        dist = 0.0
+        row = []
+        for j in range(i, m):
+            cust = permutation[j]
+            load += demands[cust]
+            if load > capacity:
+                break
+            if j == i:
+                dist = depot_row[cust]
+            else:
+                dist += dist_matrix[permutation[j - 1]][cust]
+            row.append((j, dist + dist_matrix[cust][depot_idx]))
+        segments.append(row)
 
+    dp = [[inf] * (m + 1) for _ in range(num_vehicles + 1)]
+    parent = [[-1] * (m + 1) for _ in range(num_vehicles + 1)]
+    dp[0][0] = 0.0
+
+    for k in range(1, num_vehicles + 1):
+        dp_prev = dp[k - 1]
+        dp_curr = dp[k]
+        par_curr = parent[k]
+        for i in range(m):
+            base = dp_prev[i]
+            if base == inf:
+                continue
+            for j, cost in segments[i]:
+                val = base + cost
+                if val < dp_curr[j + 1]:
+                    dp_curr[j + 1] = val
+                    par_curr[j + 1] = i
+
+    best_k = min(range(1, num_vehicles + 1), key=lambda k: dp[k][m])
+    if dp[best_k][m] == inf:
+        return None
+
+    routes = []
+    curr_j = m
+    for k in range(best_k, 0, -1):
+        prev_i = parent[k][curr_j]
+        if prev_i == -1:
+            return None
+        routes.append(permutation[prev_i:curr_j])
+        curr_j = prev_i
+    routes.reverse()
+    return routes
+
+
+def _split_full(permutation, demands, dist_matrix, depot_idx, capacity, num_vehicles):
+    """Split Prins penuh dengan penalti overload (dipakai bila kapasitas tak cukup)."""
+    m = len(permutation)
     inf = float("inf")
     seg_cost = [[inf] * m for _ in range(m)]
-    demands = [loc.get("demand", 0) for loc in locations]
     depot_row = dist_matrix[depot_idx]
 
     for i in range(m):
@@ -68,11 +115,7 @@ def decode_chromosome(
                 dist += dist_matrix[permutation[j - 1]][cust]
 
             total_trip_dist = dist + dist_matrix[cust][depot_idx]
-            penalty = (
-                (load - vehicle_capacity) * OVERLOAD_PENALTY
-                if load > vehicle_capacity
-                else 0.0
-            )
+            penalty = (load - capacity) * OVERLOAD_PENALTY if load > capacity else 0.0
             seg_row[j] = total_trip_dist + penalty
 
     dp = [[inf] * (m + 1) for _ in range(num_vehicles + 1)]
@@ -86,12 +129,11 @@ def decode_chromosome(
         for j in range(1, m + 1):
             best_c = dp_curr[j]
             best_i = -1
-            j_minus_1 = j - 1
             for i in range(k - 1, j):
                 prev_val = dp_prev[i]
                 if prev_val == inf:
                     continue
-                cost = prev_val + seg_cost[i][j_minus_1]
+                cost = prev_val + seg_cost[i][j - 1]
                 if cost < best_c:
                     best_c = cost
                     best_i = i
@@ -110,6 +152,45 @@ def decode_chromosome(
         routes.append(permutation[prev_i:curr_j])
         curr_j = prev_i
     routes.reverse()
+    return routes
+
+
+def decode_chromosome(
+    permutation: list,
+    locations: list,
+    vehicle_capacity: float,
+    num_vehicles: int,
+    dist_matrix: list,
+    depot_idx: int,
+    cache: dict = None,
+) -> list:
+    """Algoritma Split Prins (Dynamic Programming) dengan Memoization Cache.
+
+    Jalur cepat (_split_bounded) dipakai selama solusi layak mungkin; jalur
+    penuh (_split_full) hanya sebagai fallback ketika kapasitas armada tidak
+    cukup, sehingga hasilnya identik tetapi jauh lebih cepat.
+    """
+    m = len(permutation)
+    if num_vehicles <= 0 or m == 0:
+        return []
+
+    perm_key = tuple(permutation)
+    if cache is not None and perm_key in cache:
+        return [list(r) for r in cache[perm_key]]
+
+    demands = [loc.get("demand", 0) for loc in locations]
+    routes = None
+
+    total_demand = sum(demands[c] for c in permutation)
+    biggest = max(demands[c] for c in permutation)
+    if biggest <= vehicle_capacity and total_demand <= num_vehicles * vehicle_capacity:
+        routes = _split_bounded(
+            permutation, demands, dist_matrix, depot_idx, vehicle_capacity, num_vehicles
+        )
+    if routes is None:
+        routes = _split_full(
+            permutation, demands, dist_matrix, depot_idx, vehicle_capacity, num_vehicles
+        )
 
     result = routes if routes else [list(permutation)]
     if cache is not None:
@@ -132,6 +213,7 @@ def evaluate_permutation_cached(
     if perm_key in eval_cache:
         return eval_cache[perm_key]
 
+    count_miss(eval_cache)
     routes = decode_chromosome(
         permutation,
         locations,

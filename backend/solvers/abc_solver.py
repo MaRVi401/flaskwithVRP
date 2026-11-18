@@ -1,4 +1,5 @@
 import random
+from solvers.cache import BoundedCache
 from solvers.split_prins import (
     decode_chromosome,
     evaluate_permutation_cached,
@@ -23,9 +24,9 @@ def run_abc(
     vehicles = int(params["vehicles"])
 
     if decode_cache is None:
-        decode_cache = {}
+        decode_cache = BoundedCache()
     if eval_cache is None:
-        eval_cache = {}
+        eval_cache = BoundedCache()
 
     if seed_state and seed_state.get("population"):
         food_sources = [list(p) for p in seed_state["population"]]
@@ -89,18 +90,15 @@ def run_abc(
                 trial_limits[i] += 1
 
         # 2. Onlooker Bees Phase
-        qualities = [1.0 / (1.0 + e["fitness"]) for e in fitness_cache]
-        total_quality = sum(qualities)
+        # Seleksi berbasis peringkat: rumus 1/(1+fitness) hampir seragam bila
+        # fitness bernilai ratusan km, sehingga hampir tidak ada tekanan seleksi.
+        order = sorted(range(pop_size), key=lambda idx: fitness_cache[idx]["fitness"])
+        weights = [0] * pop_size
+        for rank, idx in enumerate(order):
+            weights[idx] = pop_size - rank
+        picks = random.choices(range(pop_size), weights=weights, k=pop_size)
 
-        for _ in range(pop_size):
-            r = random.random() * total_quality
-            selected = 0
-            for j in range(pop_size):
-                r -= qualities[j]
-                if r <= 0:
-                    selected = j
-                    break
-
+        for selected in picks:
             new_perm = mutate_route_neighborhood(food_sources[selected])
             new_eval = evaluate_permutation_cached(
                 new_perm,
@@ -180,6 +178,7 @@ def run_abc(
             "improvementSteps": improvement_count,
             "scoutResets": scout_resets,
             "totalEvaluations": generations * pop_size * 2,
+            "uniqueEvaluations": getattr(eval_cache, "misses", None),
             "phaseSplit": f"100% ABC ({generations} Gen)",
         },
     }

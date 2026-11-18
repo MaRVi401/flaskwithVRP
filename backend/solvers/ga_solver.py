@@ -1,4 +1,5 @@
 import random
+from solvers.cache import BoundedCache
 from solvers.split_prins import (
     decode_chromosome,
     evaluate_permutation_cached,
@@ -22,9 +23,9 @@ def run_ga(
     vehicles = int(params["vehicles"])
 
     if decode_cache is None:
-        decode_cache = {}
+        decode_cache = BoundedCache()
     if eval_cache is None:
-        eval_cache = {}
+        eval_cache = BoundedCache()
 
     population = [get_random_permutation(customer_indices) for _ in range(pop_size)]
 
@@ -122,6 +123,7 @@ def run_ga(
             "reductionPct": max(0.0, reduction_pct),
             "improvementSteps": improvement_count,
             "totalEvaluations": generations * pop_size,
+            "uniqueEvaluations": getattr(eval_cache, "misses", None),
             "phaseSplit": f"100% GA ({generations} Gen)",
         },
         "finalPopulation": population,
