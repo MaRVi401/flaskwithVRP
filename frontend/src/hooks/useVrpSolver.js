@@ -10,6 +10,14 @@ export function useVrpSolver() {
   const [error, setError] = useState(null);
   const abortControllerRef = useRef(null);
 
+  const cancelSolver = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setIsCalculating(false);
+  }, []);
+
   const loadDatasetFromApi = useCallback(async () => {
     setIsLoadingDataset(true);
     setError(null);
@@ -44,12 +52,11 @@ export function useVrpSolver() {
         formatted[0].demand = 0;
       }
 
-      return formatted;
+      return { data: formatted, error: null };
     } catch (err) {
-      console.error('[useVrpSolver] Error memuat dataset:', err);
-      setError(err.message);
-      alert(`Gagal memuat dataset dari Flask: ${err.message}`);
-      return null;
+      const msg = err.message || 'Gagal memuat dataset dari Flask';
+      setError(msg);
+      return { data: null, error: msg };
     } finally {
       setIsLoadingDataset(false);
     }
@@ -64,7 +71,27 @@ export function useVrpSolver() {
 
     setIsCalculating(true);
     setError(null);
-    const startTime = Date.now();
+
+    const cleanParams = {
+      capacity: Number(params.capacity),
+      vehicles: Number(params.vehicles),
+      generations: Number(params.generations),
+      popSize: Number(params.popSize),
+    };
+
+    // Kirim seed di level terluar payload agar terbaca oleh payload.get("seed") di app.py
+    const hasSeed =
+      params.seed !== '' &&
+      params.seed !== null &&
+      params.seed !== undefined &&
+      !isNaN(Number(params.seed));
+
+    const requestBody = {
+      algorithm,
+      locations,
+      params: cleanParams,
+      ...(hasSeed ? { seed: parseInt(params.seed, 10) } : {}),
+    };
 
     try {
       const response = await fetch(`${API_BASE_URL}/solve`, {
@@ -72,11 +99,7 @@ export function useVrpSolver() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          algorithm,
-          locations,
-          params,
-        }),
+        body: JSON.stringify(requestBody),
         signal: controller.signal,
       });
 
@@ -84,12 +107,6 @@ export function useVrpSolver() {
 
       if (!response.ok || payload.status !== 'SUCCESS') {
         throw new Error(payload.message || `Server error: ${response.status}`);
-      }
-
-      // Jeda minimal 900ms agar modal tahapan progres terlihat mulus dan informatif
-      const elapsed = Date.now() - startTime;
-      if (elapsed < 900) {
-        await new Promise((resolve) => setTimeout(resolve, 900 - elapsed));
       }
 
       if (payload.isBenchmark) {
@@ -117,16 +134,18 @@ export function useVrpSolver() {
         });
       }
 
-      return payload;
+      return { payload, error: null, aborted: false };
     } catch (err) {
-      if (err.name === 'AbortError') return null;
-      console.error('[useVrpSolver] Error:', err);
-      setError(err.message || 'Gagal terhubung ke backend Flask');
-      alert(`Gagal memproses optimasi: ${err.message || 'Periksa server Flask'}`);
-      return null;
+      if (err.name === 'AbortError') {
+        return { payload: null, error: null, aborted: true };
+      }
+      const msg = err.message || 'Gagal terhubung ke backend Flask';
+      setError(msg);
+      return { payload: null, error: msg, aborted: false };
     } finally {
       if (abortControllerRef.current === controller) {
         setIsCalculating(false);
+        abortControllerRef.current = null;
       }
     }
   }, []);
@@ -137,6 +156,7 @@ export function useVrpSolver() {
     result,
     benchmarkResult,
     runSolver,
+    cancelSolver,
     loadDatasetFromApi,
     error,
   };

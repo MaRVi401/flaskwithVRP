@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import MapView from "./components/MapView";
 import FitnessChart from "./components/FitnessChart";
 import { useVrpSolver } from "./hooks/useVrpSolver";
@@ -74,20 +74,64 @@ const routeColors = [
   "#8BC34A",
 ];
 
+const EMPTY_ROUTES = [];
+
+// Parser baris CSV yang aman terhadap tanda kutip (mis. "Pasar Baru, Indramayu")
+function parseCsvLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === "," && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
 export default function App() {
   const [locations, setLocations] = useState(defaultLocations);
+  const [fitTrigger, setFitTrigger] = useState(0);
   const [algorithm, setAlgorithm] = useState("HYBRID");
   const [params, setParams] = useState({
     capacity: 35,
     vehicles: 3,
     generations: 100,
     popSize: 40,
+    seed: "",
   });
 
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    try {
+      const saved = localStorage.getItem("vrp_dark_mode");
+      if (saved !== null) return saved === "true";
+      return (
+        window.matchMedia &&
+        window.matchMedia("(prefers-color-scheme: dark)").matches
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  const [alertModal, setAlertModal] = useState(null);
   const [showTradeOff, setShowTradeOff] = useState(false);
   const [benchmarkView, setBenchmarkView] = useState("table"); // 'table' | 'chart'
   const [singleView, setSingleView] = useState("chart"); // 'chart' | 'log'
+  const [onlyImprovements, setOnlyImprovements] = useState(false);
+  const [isAnalyticsExpanded, setIsAnalyticsExpanded] = useState(false);
   const [isRouteOutdated, setIsRouteOutdated] = useState(false);
   const [mobileTab, setMobileTab] = useState("result"); // 'result' | 'locations' | 'params'
 
@@ -106,10 +150,41 @@ export default function App() {
     result,
     benchmarkResult,
     runSolver,
+    cancelSolver,
     loadDatasetFromApi,
+    error,
   } = useVrpSolver();
 
+  const showAlert = useCallback((message, type = "error", title = null) => {
+    const defaultTitles = {
+      error: "Terjadi Kesalahan",
+      success: "Berhasil!",
+      info: "Informasi",
+    };
+    setAlertModal({
+      title: title || defaultTitles[type] || "Pemberitahuan",
+      message,
+      type,
+    });
+  }, []);
+
   useEffect(() => {
+    if (!alertModal) return;
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape" || e.key === "Enter") {
+        setAlertModal(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [alertModal]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("vrp_dark_mode", String(isDarkMode));
+    } catch {
+      // Abaikan jika storage penuh/diblokir
+    }
     if (isDarkMode) {
       document.documentElement.classList.add("dark");
     } else {
@@ -117,10 +192,13 @@ export default function App() {
     }
   }, [isDarkMode]);
 
-  const updateLocations = (newLocations) => {
+  const updateLocations = useCallback((newLocations, shouldFitMap = false) => {
     setLocations(newLocations);
     setIsRouteOutdated(true);
-  };
+    if (shouldFitMap) {
+      setFitTrigger((prev) => prev + 1);
+    }
+  }, []);
 
   const updateParams = (newParams) => {
     setParams(newParams);
@@ -132,12 +210,16 @@ export default function App() {
     setIsRouteOutdated(true);
   };
 
-  const handleRunOptimization = () => {
+  const handleRunOptimization = async () => {
     const hasDepot = locations.some((l) => l.isDepot);
     const customerCount = locations.filter((l) => !l.isDepot).length;
 
     if (!hasDepot || customerCount === 0) {
-      alert("Pastikan terdapat minimal 1 Depot dan 1 titik pelanggan.");
+      showAlert(
+        "Pastikan terdapat minimal 1 Depot dan 1 titik pelanggan sebelum menjalankan optimasi.",
+        "error",
+        "Data Belum Lengkap",
+      );
       return;
     }
     if (
@@ -146,8 +228,10 @@ export default function App() {
       params.generations <= 0 ||
       params.popSize < 2
     ) {
-      alert(
-        "Parameter Kapasitas, Armada, Generasi (>=1), dan PopSize (>=2) harus valid.",
+      showAlert(
+        "Parameter Kapasitas, Armada, Generasi (>= 1), dan Populasi (>= 2) harus diisi dengan angka yang valid.",
+        "error",
+        "Parameter Tidak Valid",
       );
       return;
     }
@@ -156,13 +240,27 @@ export default function App() {
     setShowTradeOff(false);
     setBenchmarkView("table");
     setMobileTab("result");
-    runSolver(algorithm, locations, params);
+
+    const res = await runSolver(algorithm, locations, params);
+    if (res?.error) {
+      showAlert(res.error, "error", "Gagal Memproses Optimasi");
+    } else if (res?.aborted) {
+      showAlert(
+        "Permintaan optimasi telah dibatalkan.",
+        "info",
+        "Proses Dibatalkan",
+      );
+    }
   };
 
   const handleLoadBackendDataset = async () => {
-    const datasetLocations = await loadDatasetFromApi();
-    if (datasetLocations && datasetLocations.length > 0) {
-      updateLocations(datasetLocations);
+    const res = await loadDatasetFromApi();
+    if (res?.error) {
+      showAlert(res.error, "error", "Gagal Memuat Dataset");
+      return;
+    }
+    if (res?.data && res.data.length > 0) {
+      updateLocations(res.data, true);
       if (params.capacity * params.vehicles < 250) {
         updateParams({
           ...params,
@@ -170,21 +268,29 @@ export default function App() {
           vehicles: 4,
         });
       }
+      showAlert(
+        `Berhasil memuat ${res.data.length} titik lokasi dari server Flask.`,
+        "success",
+        "Dataset Dimuat!",
+      );
     }
   };
 
-  const handleMapClick = (latlng) => {
-    const hasDepot = locations.some((l) => l.isDepot);
-    const newLoc = {
-      id: `loc-${Date.now()}`,
-      name: `Titik Peta ${locations.length + 1}`,
-      lat: latlng.lat,
-      lng: latlng.lng,
-      demand: hasDepot ? 10 : 0,
-      isDepot: !hasDepot,
-    };
-    updateLocations([...locations, newLoc]);
-  };
+  const handleMapClick = useCallback((latlng) => {
+    setLocations((prev) => {
+      const hasDepot = prev.some((l) => l.isDepot);
+      const newLoc = {
+        id: `loc-${Date.now()}`,
+        name: `Titik Peta ${prev.length + 1}`,
+        lat: latlng.lat,
+        lng: latlng.lng,
+        demand: hasDepot ? 10 : 0,
+        isDepot: !hasDepot,
+      };
+      return [...prev, newLoc];
+    });
+    setIsRouteOutdated(true);
+  }, []);
 
   const handleAddManual = (e) => {
     e.preventDefault();
@@ -209,7 +315,7 @@ export default function App() {
       isDepot: manualInput.isDepot,
     };
 
-    updateLocations([...updatedLocations, newLoc]);
+    updateLocations([...updatedLocations, newLoc], false);
     setManualInput({ name: "", lat: "", lng: "", demand: 10, isDepot: false });
   };
 
@@ -220,6 +326,7 @@ export default function App() {
         isDepot: loc.id === id,
         demand: loc.id === id ? 0 : loc.demand > 0 ? loc.demand : 10,
       })),
+      false,
     );
   };
 
@@ -245,7 +352,7 @@ export default function App() {
       return loc;
     });
 
-    updateLocations(updated);
+    updateLocations(updated, false);
     setEditingLoc(null);
   };
 
@@ -282,13 +389,13 @@ export default function App() {
             .split(/\r?\n/)
             .filter((l) => l.trim());
           lines.slice(1).forEach((line, idx) => {
-            const parts = line.split(",");
+            const parts = parseCsvLine(line);
             if (parts.length >= 3) {
               const isDepotRaw = parts[parts.length - 1];
               const demandRaw = parts[parts.length - 2];
               const lngRaw = parts[parts.length - 3];
               const latRaw = parts[parts.length - 4];
-              const nameRaw = parts.slice(0, parts.length - 4).join(",");
+              const nameRaw = parts.slice(0, parts.length - 4).join(", ");
 
               const lat = parseFloat(latRaw);
               const lng = parseFloat(lngRaw);
@@ -297,9 +404,7 @@ export default function App() {
                   (isDepotRaw || "").trim().toLowerCase() === "true";
                 parsed.push({
                   id: `csv-${idx}-${Date.now()}`,
-                  name:
-                    (nameRaw || "").trim().replace(/^"|"$/g, "") ||
-                    `Loc ${idx + 1}`,
+                  name: nameRaw || `Loc ${idx + 1}`,
                   lat,
                   lng,
                   demand: depotFlag
@@ -313,7 +418,11 @@ export default function App() {
         }
 
         if (parsed.length === 0) {
-          alert("Dataset kosong atau koordinat tidak valid.");
+          showAlert(
+            "Dataset kosong atau koordinat tidak valid.",
+            "error",
+            "Gagal Import",
+          );
           return;
         }
 
@@ -331,9 +440,18 @@ export default function App() {
           parsed[0].demand = 0;
         }
 
-        updateLocations(parsed);
-      } catch (err) {
-        alert("Format file tidak valid! Pastikan struktur CSV/JSON sesuai.");
+        updateLocations(parsed, true);
+        showAlert(
+          `Berhasil mengimpor ${parsed.length} lokasi dari file.`,
+          "success",
+          "Import Berhasil!",
+        );
+      } catch {
+        showAlert(
+          "Format file tidak valid! Pastikan struktur CSV atau JSON sesuai.",
+          "error",
+          "Format File Salah",
+        );
       } finally {
         e.target.value = "";
       }
@@ -373,11 +491,62 @@ export default function App() {
 
   const activeResult = !isRouteOutdated ? result : null;
   const activeBenchmark = !isRouteOutdated ? benchmarkResult : null;
-  const totalCustomerDemand = locations
-    .filter((l) => !l.isDepot)
-    .reduce((sum, l) => sum + (l.demand || 0), 0);
-  const totalFleetCapacity = params.capacity * params.vehicles;
-  const isCapacityEnough = totalCustomerDemand <= totalFleetCapacity;
+
+  const memoizedRoutes = useMemo(() => {
+    return activeResult ? activeResult.bestRoutes : EMPTY_ROUTES;
+  }, [activeResult]);
+
+  // Precompute baris log iterasi beserta delta & filter perbaikan
+  const logRows = useMemo(() => {
+    const hist = activeResult?.history || [];
+    const mapped = hist.map((item, idx, arr) => {
+      const prevFit = idx > 0 ? arr[idx - 1].fitness : item.fitness;
+      const diff = Number((item.fitness - prevFit).toFixed(2));
+      return {
+        ...item,
+        diff,
+        isImproved: idx === 0 || diff < 0,
+        phaseLabel:
+          item.phase ||
+          (item.generation <= Math.floor(params.generations * 0.6)
+            ? "GA Exploration"
+            : "ABC Exploitation"),
+      };
+    });
+    return onlyImprovements ? mapped.filter((r) => r.isImproved) : mapped;
+  }, [activeResult, onlyImprovements, params.generations]);
+
+  const feasibilityInfo = useMemo(() => {
+    const customers = locations.filter((l) => !l.isDepot);
+    const totalCustomerDemand = customers.reduce(
+      (sum, l) => sum + (l.demand || 0),
+      0,
+    );
+    const totalFleetCapacity =
+      (Number(params.capacity) || 0) * (Number(params.vehicles) || 0);
+    const oversizedCustomer = customers.find(
+      (l) => (l.demand || 0) > (Number(params.capacity) || 0),
+    );
+
+    const isTotalOver = totalCustomerDemand > totalFleetCapacity;
+    const isSingleOver = Boolean(oversizedCustomer);
+    const isFeasible = !isTotalOver && !isSingleOver;
+
+    let reason = "";
+    if (isSingleOver) {
+      reason = `Demand "${oversizedCustomer.name}" (${oversizedCustomer.demand}) melebihi kapasitas armada (${params.capacity})`;
+    } else if (isTotalOver) {
+      reason = `Total demand (${totalCustomerDemand}) melebihi total kapasitas (${totalFleetCapacity})`;
+    }
+
+    return {
+      totalCustomerDemand,
+      totalFleetCapacity,
+      isFeasible,
+      isSingleOver,
+      reason,
+    };
+  }, [locations, params.capacity, params.vehicles]);
 
   const cardSurface = isDarkMode
     ? "bg-slate-800/95 border-slate-700/80"
@@ -387,6 +556,399 @@ export default function App() {
     ? "bg-slate-900 border-slate-700 text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
     : "bg-slate-50 border-slate-200 text-slate-800 placeholder-slate-400 focus:border-indigo-500 focus:outline-none";
 
+  // Helper render konten Analitik (dipakai baik di panel bawah maupun modal fullscreen)
+  const renderAnalyticsContent = (isExpanded = false) => {
+    if (activeBenchmark) {
+      return (
+        <div className="h-full flex flex-col min-h-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-2 shrink-0">
+            <h3
+              className={`${
+                isExpanded ? "text-sm" : "text-xs"
+              } font-bold uppercase tracking-wider opacity-85 flex items-center gap-1.5`}
+            >
+              <i className="ti ti-flame text-orange-500 text-base"></i>
+              <span>Perbandingan Benchmark Algoritma</span>
+            </h3>
+
+            <div className="flex items-center gap-1.5">
+              <div
+                className={`inline-flex p-0.5 rounded-lg border ${
+                  isDarkMode
+                    ? "bg-slate-900 border-slate-700"
+                    : "bg-slate-100 border-slate-200"
+                }`}
+              >
+                <button
+                  onClick={() => setBenchmarkView("table")}
+                  className={`text-[11px] font-bold px-2.5 py-1 rounded-md cursor-pointer transition flex items-center gap-1 ${
+                    benchmarkView === "table"
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : isDarkMode
+                        ? "text-slate-300 hover:text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <i className="ti ti-table text-xs"></i>
+                  <span>Tabel</span>
+                </button>
+                <button
+                  onClick={() => setBenchmarkView("chart")}
+                  className={`text-[11px] font-bold px-2.5 py-1 rounded-md cursor-pointer transition flex items-center gap-1 ${
+                    benchmarkView === "chart"
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : isDarkMode
+                        ? "text-slate-300 hover:text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <i className="ti ti-chart-line text-xs"></i>
+                  <span>Kurva</span>
+                </button>
+              </div>
+
+              <button
+                onClick={() => setIsAnalyticsExpanded(!isExpanded)}
+                title={
+                  isExpanded ? "Perkecil Tampilan" : "Perbesar Tabel & Grafik"
+                }
+                className={`p-1.5 rounded-lg border text-xs transition cursor-pointer ${
+                  isDarkMode
+                    ? "bg-slate-700/80 border-slate-600 text-slate-200 hover:bg-slate-600"
+                    : "bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200"
+                }`}
+              >
+                <i
+                  className={`ti ${
+                    isExpanded ? "ti-arrows-minimize" : "ti-arrows-maximize"
+                  } text-sm`}
+                ></i>
+              </button>
+            </div>
+          </div>
+
+          {benchmarkView === "table" ? (
+            <div
+              className={`flex-1 overflow-auto rounded-xl border ${
+                isDarkMode ? "border-slate-700" : "border-slate-200"
+              }`}
+            >
+              <table className="w-full text-left border-collapse min-w-[460px]">
+                <thead
+                  className={`text-[10px] sm:text-[11px] uppercase sticky top-0 z-10 ${
+                    isDarkMode
+                      ? "bg-slate-900 text-slate-300 border-b border-slate-700"
+                      : "bg-slate-100 text-slate-700 border-b border-slate-200"
+                  }`}
+                >
+                  <tr>
+                    <th className="py-2 px-3 whitespace-nowrap">Algoritma</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Total Jarak</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Efisiensi</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Waktu CPU</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Evaluasi</th>
+                    <th className="py-2 px-3 whitespace-nowrap">Status</th>
+                  </tr>
+                </thead>
+                <tbody
+                  className={`divide-y text-xs ${
+                    isDarkMode ? "divide-slate-700/80" : "divide-slate-200"
+                  }`}
+                >
+                  {Object.entries(activeBenchmark).map(([alg, d]) => {
+                    const isWinner = activeResult?.winnerAlgorithm === alg;
+                    return (
+                      <tr
+                        key={alg}
+                        className={`transition-colors ${
+                          isWinner
+                            ? isDarkMode
+                              ? "bg-indigo-950/50"
+                              : "bg-indigo-50/80"
+                            : isDarkMode
+                              ? "hover:bg-slate-900/50"
+                              : "hover:bg-slate-50"
+                        }`}
+                      >
+                        <td className="py-2.5 px-3 font-extrabold text-indigo-500 whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            <span>{alg}</span>
+                            {isWinner && (
+                              <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-500 text-[10px] font-bold">
+                                ★ Terbaik
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-3 font-mono font-bold whitespace-nowrap">
+                          {d.bestDistance.toFixed(2)} km
+                        </td>
+                        <td className="py-2.5 px-3 text-emerald-500 font-bold whitespace-nowrap">
+                          -{d.metrics?.reductionPct ?? 0}%
+                        </td>
+                        <td className="py-2.5 px-3 font-mono whitespace-nowrap">
+                          {d.time} ms
+                        </td>
+                        <td className="py-2.5 px-3 font-mono opacity-80 whitespace-nowrap">
+                          {d.metrics?.totalEvaluations ?? "-"}
+                        </td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          {d.isFeasible === false ? (
+                            <span className="px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-500 text-[11px] font-bold inline-flex items-center gap-1">
+                              <i className="ti ti-alert-triangle text-xs"></i>
+                              Overload
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500 text-[11px] font-bold inline-flex items-center gap-1">
+                              <i className="ti ti-circle-check text-xs"></i>
+                              Valid
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="flex-1 min-h-[160px] w-full">
+              <FitnessChart
+                benchmarkData={activeBenchmark}
+                isDarkMode={isDarkMode}
+                isExpanded={isExpanded}
+              />
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="h-full flex flex-col min-h-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2 shrink-0">
+          <h3
+            className={`${
+              isExpanded ? "text-sm" : "text-xs"
+            } font-bold uppercase tracking-wider opacity-85 flex items-center gap-1.5`}
+          >
+            <i className="ti ti-chart-line text-indigo-500 text-base"></i>
+            <span>
+              {singleView === "chart"
+                ? "Kurva Konvergensi Fitness"
+                : "Efektivitas & Log Iterasi"}
+            </span>
+          </h3>
+
+          <div className="flex items-center gap-1.5">
+            {activeResult && (
+              <div
+                className={`inline-flex p-0.5 rounded-lg border ${
+                  isDarkMode
+                    ? "bg-slate-900 border-slate-700"
+                    : "bg-slate-100 border-slate-200"
+                }`}
+              >
+                <button
+                  onClick={() => setSingleView("chart")}
+                  className={`text-[11px] font-bold px-2.5 py-1 rounded-md cursor-pointer transition flex items-center gap-1 ${
+                    singleView === "chart"
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : isDarkMode
+                        ? "text-slate-300 hover:text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <i className="ti ti-chart-line text-xs"></i>
+                  <span>Kurva</span>
+                </button>
+                <button
+                  onClick={() => setSingleView("log")}
+                  className={`text-[11px] font-bold px-2.5 py-1 rounded-md cursor-pointer transition flex items-center gap-1 ${
+                    singleView === "log"
+                      ? "bg-indigo-600 text-white shadow-sm"
+                      : isDarkMode
+                        ? "text-slate-300 hover:text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  <i className="ti ti-list-details text-xs"></i>
+                  <span>Log & Efektivitas</span>
+                </button>
+              </div>
+            )}
+
+            <button
+              onClick={() => setIsAnalyticsExpanded(!isExpanded)}
+              title={
+                isExpanded ? "Perkecil Tampilan" : "Perbesar Tabel & Grafik"
+              }
+              className={`p-1.5 rounded-lg border text-xs transition cursor-pointer ${
+                isDarkMode
+                  ? "bg-slate-700/80 border-slate-600 text-slate-200 hover:bg-slate-600"
+                  : "bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200"
+              }`}
+            >
+              <i
+                className={`ti ${
+                  isExpanded ? "ti-arrows-minimize" : "ti-arrows-maximize"
+                } text-sm`}
+              ></i>
+            </button>
+          </div>
+        </div>
+
+        {singleView === "log" && activeResult ? (
+          <div className="flex-1 flex flex-col min-h-0 gap-2 text-xs">
+            {/* Kartu Ringkasan Efektivitas & Splitting (Responsif tanpa teks terpotong) */}
+            <div
+              className={`grid grid-cols-1 sm:grid-cols-3 gap-2 p-2.5 rounded-xl border shrink-0 ${
+                isDarkMode
+                  ? "bg-slate-900/90 border-slate-700"
+                  : "bg-indigo-50/70 border-indigo-200/80"
+              }`}
+            >
+              <div className="space-y-0.5">
+                <div className="text-[10px] font-bold opacity-65 uppercase tracking-wide">
+                  Efektivitas Jarak
+                </div>
+                <div className="font-black text-emerald-500 text-xs leading-snug">
+                  -{activeResult.metrics?.reductionPct ?? 0}%{" "}
+                  <span className="font-mono font-semibold opacity-90">
+                    ({activeResult.metrics?.initialDistance} →{" "}
+                    {activeResult.metrics?.finalDistance} km)
+                  </span>
+                </div>
+              </div>
+
+              <div className="space-y-0.5">
+                <div className="text-[10px] font-bold opacity-65 uppercase tracking-wide">
+                  Fase & Splitting
+                </div>
+                <div className="font-bold text-xs leading-snug break-words">
+                  {activeResult.metrics?.phaseSplit ||
+                    `${params.generations} Gen • Split Prins DP`}
+                </div>
+              </div>
+
+              <div className="space-y-0.5">
+                <div className="text-[10px] font-bold opacity-65 uppercase tracking-wide">
+                  Pergerakan Solusi
+                </div>
+                <div className="font-bold text-xs leading-snug">
+                  {activeResult.metrics?.improvementSteps ?? 0}x Update •{" "}
+                  <span className="font-mono">
+                    {activeResult.metrics?.totalEvaluations ?? 0} Eval
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Filter Log Iterasi */}
+            <div className="flex items-center justify-between text-[11px] shrink-0 px-0.5">
+              <span className="opacity-70 font-medium">
+                Menampilkan <strong>{logRows.length}</strong> baris iterasi
+              </span>
+              <button
+                type="button"
+                onClick={() => setOnlyImprovements(!onlyImprovements)}
+                className={`px-2 py-0.5 rounded-md font-bold border transition cursor-pointer flex items-center gap-1 ${
+                  onlyImprovements
+                    ? "bg-emerald-600 border-emerald-600 text-white"
+                    : isDarkMode
+                      ? "bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700"
+                      : "bg-white border-slate-300 text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                <i className="ti ti-filter text-xs"></i>
+                <span>
+                  {onlyImprovements
+                    ? "Hanya Update (Aktif)"
+                    : "Filter: Hanya Update"}
+                </span>
+              </button>
+            </div>
+
+            {/* Tabel Log Pergerakan Tiap Generasi */}
+            <div
+              className={`flex-1 min-h-[110px] overflow-auto border rounded-xl ${
+                isDarkMode ? "border-slate-700" : "border-slate-200"
+              }`}
+            >
+              <table className="w-full text-left border-collapse min-w-[380px] text-[11px]">
+                <thead
+                  className={`uppercase sticky top-0 z-10 text-[10px] ${
+                    isDarkMode
+                      ? "bg-slate-900 text-slate-300 border-b border-slate-700"
+                      : "bg-slate-100 text-slate-700 border-b border-slate-200"
+                  }`}
+                >
+                  <tr>
+                    <th className="py-2 px-3 whitespace-nowrap">Iterasi</th>
+                    <th className="py-2 px-3 whitespace-nowrap">
+                      Fase Pencarian
+                    </th>
+                    <th className="py-2 px-3 whitespace-nowrap">
+                      Jarak Terbaik
+                    </th>
+                    <th className="py-2 px-3 whitespace-nowrap">
+                      Perubahan (Delta)
+                    </th>
+                  </tr>
+                </thead>
+                <tbody
+                  className={`divide-y ${
+                    isDarkMode ? "divide-slate-800" : "divide-slate-200"
+                  }`}
+                >
+                  {logRows.map((item) => (
+                    <tr
+                      key={item.generation}
+                      className={
+                        item.diff < 0
+                          ? isDarkMode
+                            ? "bg-emerald-950/25"
+                            : "bg-emerald-50/60"
+                          : ""
+                      }
+                    >
+                      <td className="py-1.5 px-3 font-mono font-bold whitespace-nowrap">
+                        Gen #{item.generation}
+                      </td>
+                      <td className="py-1.5 px-3 opacity-85 whitespace-nowrap">
+                        {item.phaseLabel}
+                      </td>
+                      <td className="py-1.5 px-3 font-mono font-bold text-indigo-500 whitespace-nowrap">
+                        {Number(item.fitness).toFixed(2)} km
+                      </td>
+                      <td className="py-1.5 px-3 font-mono font-bold whitespace-nowrap">
+                        {item.diff < 0 ? (
+                          <span className="text-emerald-500">
+                            {item.diff.toFixed(2)} km
+                          </span>
+                        ) : (
+                          <span className="opacity-45">0.00 km</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 min-h-[160px] w-full">
+            <FitnessChart
+              historyData={activeResult ? activeResult.history : []}
+              isDarkMode={isDarkMode}
+              isExpanded={isExpanded}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div
       className={`min-h-screen lg:h-screen w-full p-2.5 sm:p-3.5 pb-20 lg:pb-3.5 font-sans flex flex-col lg:overflow-hidden transition-colors duration-200 ${
@@ -395,6 +957,84 @@ export default function App() {
           : "bg-slate-100 text-slate-800"
       }`}
     >
+      {/* Popup Modal Bergaya SweetAlert di Tengah Layar */}
+      {alertModal && (
+        <div
+          onClick={() => setAlertModal(null)}
+          className="fixed inset-0 z-[10000] flex items-center justify-center p-4 bg-slate-950/65 backdrop-blur-sm transition-opacity"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-sm p-6 rounded-2xl border shadow-2xl text-center space-y-4 transform transition-all ${
+              isDarkMode
+                ? "bg-slate-900 border-slate-700 text-slate-100"
+                : "bg-white border-slate-200 text-slate-800"
+            }`}
+          >
+            <div
+              className={`w-16 h-16 mx-auto rounded-full flex items-center justify-center border-4 ${
+                alertModal.type === "error"
+                  ? "bg-rose-500/10 border-rose-500/30 text-rose-500"
+                  : alertModal.type === "success"
+                    ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-500"
+                    : "bg-indigo-500/10 border-indigo-500/30 text-indigo-500"
+              }`}
+            >
+              <i
+                className={`ti ${
+                  alertModal.type === "error"
+                    ? "ti-x text-3xl"
+                    : alertModal.type === "success"
+                      ? "ti-check text-3xl"
+                      : "ti-info-circle text-3xl"
+                }`}
+              ></i>
+            </div>
+
+            <div className="space-y-1.5">
+              <h3 className="text-lg font-black tracking-tight">
+                {alertModal.title}
+              </h3>
+              <p className="text-xs sm:text-sm opacity-75 leading-relaxed">
+                {alertModal.message}
+              </p>
+            </div>
+
+            <div className="pt-1">
+              <button
+                type="button"
+                autoFocus
+                onClick={() => setAlertModal(null)}
+                className={`w-full py-2.5 px-5 rounded-xl text-xs font-extrabold text-white shadow-md transition active:scale-[0.98] cursor-pointer ${
+                  alertModal.type === "error"
+                    ? "bg-rose-600 hover:bg-rose-700"
+                    : alertModal.type === "success"
+                      ? "bg-emerald-600 hover:bg-emerald-700"
+                      : "bg-indigo-600 hover:bg-indigo-700"
+                }`}
+              >
+                OK, Mengerti
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Fullscreen untuk Tabel & Grafik (Bila diperbesar) */}
+      {isAnalyticsExpanded && (
+        <div
+          onClick={() => setIsAnalyticsExpanded(false)}
+          className="fixed inset-0 z-[9998] flex items-center justify-center p-3 sm:p-6 bg-slate-950/75 backdrop-blur-sm"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-5xl h-[82vh] p-4 sm:p-6 rounded-2xl border shadow-2xl flex flex-col min-h-0 ${cardSurface}`}
+          >
+            {renderAnalyticsContent(true)}
+          </div>
+        </div>
+      )}
+
       {/* 1. Sticky Header */}
       <header
         className={`sticky top-2 z-30 min-h-[3.25rem] px-3 sm:px-4 py-2 lg:py-0 rounded-xl shadow-sm border backdrop-blur-md flex items-center justify-between gap-2 shrink-0 mb-3 transition-colors ${cardSurface}`}
@@ -419,8 +1059,9 @@ export default function App() {
 
         <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
           <div
+            title={feasibilityInfo.reason || "Kapasitas armada mencukupi"}
             className={`hidden md:flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg border ${
-              isCapacityEnough
+              feasibilityInfo.isFeasible
                 ? isDarkMode
                   ? "bg-emerald-950/40 border-emerald-800/60 text-emerald-300"
                   : "bg-emerald-50 border-emerald-200 text-emerald-700"
@@ -429,11 +1070,21 @@ export default function App() {
                   : "bg-rose-50 border-rose-200 text-rose-700"
             }`}
           >
-            <i className="ti ti-package text-sm"></i>
+            <i
+              className={`ti ${
+                feasibilityInfo.isFeasible ? "ti-package" : "ti-alert-triangle"
+              } text-sm`}
+            ></i>
             <span>Muatan:</span>
             <strong>
-              {totalCustomerDemand} / {totalFleetCapacity}
+              {feasibilityInfo.totalCustomerDemand} /{" "}
+              {feasibilityInfo.totalFleetCapacity}
             </strong>
+            {!feasibilityInfo.isFeasible && (
+              <span className="ml-1 px-1.5 py-0.2 rounded bg-rose-600 text-white text-[9px] font-extrabold uppercase">
+                Tidak Feasible
+              </span>
+            )}
           </div>
 
           {activeResult && (
@@ -484,19 +1135,39 @@ export default function App() {
         </div>
       </header>
 
+      {/* Banner Peringatan Kapasitas */}
+      {!feasibilityInfo.isFeasible && (
+        <div
+          className={`mb-3 px-3.5 py-2 rounded-xl border text-xs flex items-center gap-2 shrink-0 ${
+            isDarkMode
+              ? "bg-rose-950/40 border-rose-800/80 text-rose-200"
+              : "bg-rose-50 border-rose-200 text-rose-800"
+          }`}
+        >
+          <i className="ti ti-alert-triangle text-rose-500 text-base shrink-0"></i>
+          <span>
+            <strong>Peringatan Kapasitas (Tidak Feasible):</strong>{" "}
+            {feasibilityInfo.reason}. Tingkatkan kapasitas per armada atau
+            sesuaikan jumlah armada.
+          </span>
+        </div>
+      )}
+
       {/* 2. Main Grid Layout */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-0 lg:overflow-hidden">
         {/* KOLOM KANAN (DESKTOP) / ATAS (MOBILE): Peta + Panel Hasil */}
         <div className="order-1 lg:order-2 lg:col-span-8 flex flex-col gap-3 min-h-0">
           {/* Peta Interaktif */}
           <div
-            className={`p-2 rounded-xl shadow-sm border h-[300px] sm:h-[380px] lg:h-auto lg:flex-1 flex flex-col min-h-0 relative transition-colors ${cardSurface}`}
+            className={`p-2 rounded-xl shadow-sm border h-[280px] sm:h-[360px] lg:h-auto lg:flex-1 flex flex-col min-h-0 relative transition-colors ${cardSurface}`}
           >
             <div className="flex-1 rounded-lg overflow-hidden relative z-0">
               <MapView
                 locations={locations}
-                routes={activeResult ? activeResult.bestRoutes : []}
+                routes={memoizedRoutes}
                 onMapClick={handleMapClick}
+                fitTrigger={fitTrigger}
+                isDarkMode={isDarkMode}
               />
             </div>
             <div className="mt-1.5 px-1 flex justify-between items-center text-[10px] opacity-65">
@@ -544,27 +1215,27 @@ export default function App() {
             ))}
           </div>
 
-          {/* Panel Hasil & Grafik */}
+          {/* Panel Hasil & Grafik (Tinggi lebih proporsional agar tabel & grafik lega) */}
           <div
             className={`${
               mobileTab === "result" ? "flex" : "hidden lg:flex"
-            } h-auto md:h-56 lg:h-52 p-3 rounded-xl shadow-sm border shrink-0 flex-col md:flex-row gap-3 lg:overflow-hidden transition-colors ${cardSurface}`}
+            } h-auto md:h-[260px] lg:h-[275px] p-3.5 rounded-xl shadow-sm border shrink-0 flex-col md:flex-row gap-3.5 lg:overflow-hidden transition-colors ${cardSurface}`}
           >
             {/* Status Hasil Rute */}
             <div
-              className={`w-full md:w-5/12 flex flex-col justify-between border-b md:border-b-0 md:border-r pb-3 md:pb-0 md:pr-3 min-h-0 ${
+              className={`w-full md:w-5/12 flex flex-col justify-between border-b md:border-b-0 md:border-r pb-3 md:pb-0 md:pr-3.5 min-h-0 ${
                 isDarkMode ? "border-slate-700" : "border-slate-200"
               }`}
             >
               <div className="flex flex-col h-full min-h-0">
-                <div className="flex justify-between items-center mb-1.5 shrink-0">
-                  <h3 className="text-xs font-bold uppercase tracking-wider opacity-80 flex items-center gap-1.5">
+                <div className="flex justify-between items-center mb-2 shrink-0">
+                  <h3 className="text-xs font-bold uppercase tracking-wider opacity-85 flex items-center gap-1.5">
                     <i
                       className={`ti ${
                         showTradeOff
                           ? "ti-bulb text-amber-500"
                           : "ti-route-2 text-indigo-500"
-                      } text-sm`}
+                      } text-base`}
                     ></i>
                     <span>
                       {showTradeOff
@@ -576,7 +1247,7 @@ export default function App() {
                   </h3>
                   <button
                     onClick={() => setShowTradeOff(!showTradeOff)}
-                    className={`text-[10px] font-bold px-2 py-0.5 rounded-md flex items-center gap-1 transition cursor-pointer ${
+                    className={`text-[11px] font-bold px-2.5 py-1 rounded-lg flex items-center gap-1 transition cursor-pointer ${
                       isDarkMode
                         ? "bg-indigo-950 text-indigo-300 hover:bg-indigo-900"
                         : "bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
@@ -592,20 +1263,24 @@ export default function App() {
                 </div>
 
                 {showTradeOff ? (
-                  <div className="flex-1 min-h-0 overflow-y-auto text-[11px]">
-                    <table className="w-full text-left border-collapse">
+                  <div
+                    className={`flex-1 min-h-0 overflow-auto rounded-xl border ${
+                      isDarkMode ? "border-slate-700" : "border-slate-200"
+                    }`}
+                  >
+                    <table className="w-full text-left border-collapse text-xs">
                       <thead
                         className={`text-[10px] uppercase sticky top-0 ${
                           isDarkMode
-                            ? "bg-slate-900 text-slate-400"
-                            : "bg-slate-100 text-slate-600"
+                            ? "bg-slate-900 text-slate-300"
+                            : "bg-slate-100 text-slate-700"
                         }`}
                       >
                         <tr>
-                          <th className="p-1.5">Armada</th>
-                          <th className="p-1.5">Jarak</th>
-                          <th className="p-1.5">Waktu</th>
-                          <th className="p-1.5">BBM</th>
+                          <th className="p-2">Armada</th>
+                          <th className="p-2">Jarak</th>
+                          <th className="p-2">Waktu</th>
+                          <th className="p-2">BBM</th>
                         </tr>
                       </thead>
                       <tbody
@@ -614,26 +1289,26 @@ export default function App() {
                         }`}
                       >
                         <tr>
-                          <td className="p-1.5 font-bold">Sedikit</td>
-                          <td className="p-1.5 text-emerald-500 font-semibold">
+                          <td className="p-2 font-bold">Sedikit</td>
+                          <td className="p-2 text-emerald-500 font-semibold">
                             Pendek
                           </td>
-                          <td className="p-1.5 text-amber-500 font-semibold">
+                          <td className="p-2 text-amber-500 font-semibold">
                             Lama
                           </td>
-                          <td className="p-1.5 text-emerald-500 font-semibold">
+                          <td className="p-2 text-emerald-500 font-semibold">
                             Hemat
                           </td>
                         </tr>
                         <tr>
-                          <td className="p-1.5 font-bold">Banyak</td>
-                          <td className="p-1.5 text-rose-500 font-semibold">
+                          <td className="p-2 font-bold">Banyak</td>
+                          <td className="p-2 text-rose-500 font-semibold">
                             Panjang
                           </td>
-                          <td className="p-1.5 text-emerald-500 font-semibold">
+                          <td className="p-2 text-emerald-500 font-semibold">
                             Cepat
                           </td>
-                          <td className="p-1.5 text-rose-500 font-semibold">
+                          <td className="p-2 text-rose-500 font-semibold">
                             Boros
                           </td>
                         </tr>
@@ -641,20 +1316,22 @@ export default function App() {
                     </table>
                   </div>
                 ) : activeResult ? (
-                  <div className="flex flex-col h-full min-h-0 space-y-1.5">
+                  <div className="flex flex-col h-full min-h-0 space-y-2">
                     <div className="shrink-0 flex items-baseline justify-between gap-2">
                       <div>
                         <span className="text-xl sm:text-2xl font-black text-indigo-500">
                           {activeResult.bestDistance.toFixed(2)} km
                         </span>
-                        <div className="text-[10px] opacity-65 flex items-center gap-1">
-                          <i className="ti ti-clock text-xs"></i>
-                          <span>
+                        <div className="text-[11px] opacity-70 flex flex-wrap items-center gap-1.5 mt-0.5">
+                          <span className="inline-flex items-center gap-0.5">
+                            <i className="ti ti-clock text-xs"></i>
                             {activeResult.executionTime || activeResult.time} ms
                           </span>
                           <span>•</span>
-                          <i className="ti ti-truck text-xs"></i>
-                          <span>{activeResult.bestRoutes.length} Armada</span>
+                          <span className="inline-flex items-center gap-0.5">
+                            <i className="ti ti-truck text-xs"></i>
+                            {activeResult.bestRoutes.length} Armada
+                          </span>
                           {activeResult.metrics?.reductionPct > 0 && (
                             <>
                               <span>•</span>
@@ -667,12 +1344,12 @@ export default function App() {
                       </div>
 
                       {activeResult.isFeasible === false ? (
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-500 border border-rose-500/30 flex items-center gap-1">
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-500 border border-rose-500/30 flex items-center gap-1 shrink-0">
                           <i className="ti ti-alert-triangle text-xs"></i>
                           Overload
                         </span>
                       ) : (
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 flex items-center gap-1">
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500 border border-emerald-500/30 flex items-center gap-1 shrink-0">
                           <i className="ti ti-circle-check text-xs"></i>
                           Valid
                         </span>
@@ -680,7 +1357,7 @@ export default function App() {
                     </div>
 
                     <div
-                      className={`max-h-52 md:max-h-none flex-1 min-h-0 overflow-y-auto space-y-1.5 text-[11px] border-t pt-1.5 pr-1 ${
+                      className={`max-h-60 md:max-h-none flex-1 min-h-0 overflow-y-auto space-y-1.5 text-[11px] border-t pt-2 pr-1 ${
                         isDarkMode ? "border-slate-700" : "border-slate-100"
                       }`}
                     >
@@ -702,13 +1379,13 @@ export default function App() {
                                 : "bg-slate-50 border-slate-200/80 text-slate-700"
                             }`}
                           >
-                            <div className="flex justify-between items-center mb-0.5">
+                            <div className="flex justify-between items-center mb-1">
                               <span className="font-bold text-[11px] flex items-center gap-1">
                                 <i className="ti ti-truck-delivery text-xs opacity-75"></i>
                                 Armada #{i + 1}
                               </span>
                               <span
-                                className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${
+                                className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
                                   isOverload
                                     ? "bg-rose-500/15 text-rose-500"
                                     : "bg-emerald-500/15 text-emerald-500"
@@ -717,7 +1394,7 @@ export default function App() {
                                 {routeLoad}/{params.capacity} unit
                               </span>
                             </div>
-                            <div className="text-[10px] opacity-85 flex flex-wrap items-center gap-1">
+                            <div className="text-[11px] opacity-90 flex flex-wrap items-center gap-1 leading-relaxed">
                               <span className="font-semibold">Depot</span>
                               {r.map((c, idx) => (
                                 <React.Fragment key={idx}>
@@ -734,8 +1411,8 @@ export default function App() {
                     </div>
                   </div>
                 ) : (
-                  <div className="flex-1 flex flex-col items-center justify-center text-center text-xs opacity-60 italic py-4 px-2 gap-1">
-                    <i className="ti ti-info-circle text-lg"></i>
+                  <div className="flex-1 flex flex-col items-center justify-center text-center text-xs opacity-60 italic py-4 px-2 gap-1.5">
+                    <i className="ti ti-info-circle text-xl"></i>
                     <span>
                       {isCalculating
                         ? "Menghitung rute optimal..."
@@ -748,276 +1425,9 @@ export default function App() {
               </div>
             </div>
 
-            {/* Grafik Konvergensi / Tabel Benchmark / Log Iterasi */}
-            <div className="w-full md:w-7/12 h-48 md:h-full flex flex-col min-h-0 overflow-hidden">
-              {activeBenchmark ? (
-                <div className="h-full flex flex-col min-h-0">
-                  <div className="flex items-center justify-between mb-1.5 shrink-0">
-                    <h3 className="text-xs font-bold uppercase tracking-wider opacity-80 flex items-center gap-1.5">
-                      <i className="ti ti-flame text-orange-500 text-sm"></i>
-                      <span>Perbandingan Benchmark</span>
-                    </h3>
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => setBenchmarkView("table")}
-                        className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
-                          benchmarkView === "table"
-                            ? "bg-indigo-600 text-white"
-                            : isDarkMode
-                              ? "bg-slate-700 text-slate-300"
-                              : "bg-slate-100 text-slate-600"
-                        }`}
-                      >
-                        Tabel
-                      </button>
-                      <button
-                        onClick={() => setBenchmarkView("chart")}
-                        className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
-                          benchmarkView === "chart"
-                            ? "bg-indigo-600 text-white"
-                            : isDarkMode
-                              ? "bg-slate-700 text-slate-300"
-                              : "bg-slate-100 text-slate-600"
-                        }`}
-                      >
-                        Kurva
-                      </button>
-                    </div>
-                  </div>
-
-                  {benchmarkView === "table" ? (
-                    <div className="flex-1 overflow-x-auto overflow-y-auto text-xs">
-                      <table className="w-full text-left min-w-[340px]">
-                        <thead
-                          className={`text-[10px] uppercase sticky top-0 ${
-                            isDarkMode
-                              ? "bg-slate-900 text-slate-400"
-                              : "bg-slate-100 text-slate-600"
-                          }`}
-                        >
-                          <tr>
-                            <th className="p-1.5">Algoritma</th>
-                            <th className="p-1.5">Total Jarak</th>
-                            <th className="p-1.5">Reduksi</th>
-                            <th className="p-1.5">Waktu</th>
-                            <th className="p-1.5">Status</th>
-                          </tr>
-                        </thead>
-                        <tbody
-                          className={`divide-y text-[11px] ${
-                            isDarkMode ? "divide-slate-700" : "divide-slate-200"
-                          }`}
-                        >
-                          {Object.entries(activeBenchmark).map(([alg, d]) => {
-                            const isWinner =
-                              activeResult?.winnerAlgorithm === alg;
-                            return (
-                              <tr
-                                key={alg}
-                                className={
-                                  isWinner
-                                    ? isDarkMode
-                                      ? "bg-indigo-950/40"
-                                      : "bg-indigo-50/70"
-                                    : ""
-                                }
-                              >
-                                <td className="p-1.5 font-extrabold text-indigo-500">
-                                  {alg} {isWinner && "★"}
-                                </td>
-                                <td className="p-1.5 font-bold">
-                                  {d.bestDistance.toFixed(2)} km
-                                </td>
-                                <td className="p-1.5 text-emerald-500 font-bold">
-                                  -{d.metrics?.reductionPct ?? 0}%
-                                </td>
-                                <td className="p-1.5">{d.time} ms</td>
-                                <td className="p-1.5">
-                                  {d.isFeasible === false ? (
-                                    <span className="text-rose-500 font-bold inline-flex items-center gap-0.5">
-                                      <i className="ti ti-x text-xs"></i>{" "}
-                                      Overload
-                                    </span>
-                                  ) : (
-                                    <span className="text-emerald-500 font-bold inline-flex items-center gap-0.5">
-                                      <i className="ti ti-check text-xs"></i>{" "}
-                                      Valid
-                                    </span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="flex-1 min-h-0 w-full">
-                      <FitnessChart
-                        benchmarkData={activeBenchmark}
-                        isDarkMode={isDarkMode}
-                      />
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="h-full flex flex-col min-h-0">
-                  <div className="flex items-center justify-between mb-1.5 shrink-0 gap-2">
-                    <h3 className="text-xs font-bold uppercase tracking-wider opacity-80 flex items-center gap-1.5 truncate">
-                      <i className="ti ti-chart-line text-indigo-500 text-sm"></i>
-                      <span>
-                        {singleView === "chart"
-                          ? "Kurva Konvergensi Fitness"
-                          : "Efektivitas & Log Iterasi"}
-                      </span>
-                    </h3>
-
-                    {activeResult && (
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => setSingleView("chart")}
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
-                            singleView === "chart"
-                              ? "bg-indigo-600 text-white"
-                              : isDarkMode
-                                ? "bg-slate-700 text-slate-300"
-                                : "bg-slate-100 text-slate-600"
-                          }`}
-                        >
-                          Kurva
-                        </button>
-                        <button
-                          onClick={() => setSingleView("log")}
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-md cursor-pointer transition ${
-                            singleView === "log"
-                              ? "bg-indigo-600 text-white"
-                              : isDarkMode
-                                ? "bg-slate-700 text-slate-300"
-                                : "bg-slate-100 text-slate-600"
-                          }`}
-                        >
-                          Log & Efektivitas
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  {singleView === "log" && activeResult ? (
-                    <div className="flex-1 flex flex-col min-h-0 gap-1.5 text-[11px]">
-                      {/* Kartu Ringkasan Efektivitas & Splitting */}
-                      <div
-                        className={`grid grid-cols-3 gap-1.5 p-2 rounded-lg border shrink-0 ${
-                          isDarkMode
-                            ? "bg-slate-900/90 border-slate-700"
-                            : "bg-indigo-50/60 border-indigo-200/80"
-                        }`}
-                      >
-                        <div>
-                          <div className="text-[9px] opacity-65 uppercase">
-                            Efektivitas Jarak
-                          </div>
-                          <div className="font-black text-emerald-500">
-                            -{activeResult.metrics?.reductionPct ?? 0}% (
-                            {activeResult.metrics?.initialDistance} →{" "}
-                            {activeResult.metrics?.finalDistance} km)
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-[9px] opacity-65 uppercase">
-                            Fase & Splitting
-                          </div>
-                          <div className="font-bold truncate">
-                            {activeResult.metrics?.phaseSplit ||
-                              `${params.generations} Gen • Split Prins DP`}
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-[9px] opacity-65 uppercase">
-                            Pergerakan Solusi
-                          </div>
-                          <div className="font-bold">
-                            {activeResult.metrics?.improvementSteps ?? 0}x
-                            Update • {activeResult.metrics?.totalEvaluations ?? 0}{" "}
-                            Eval
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Tabel Log Pergerakan Tiap Generasi */}
-                      <div
-                        className={`flex-1 overflow-y-auto border rounded-lg ${
-                          isDarkMode ? "border-slate-700" : "border-slate-200"
-                        }`}
-                      >
-                        <table className="w-full text-left text-[10px]">
-                          <thead
-                            className={`uppercase sticky top-0 ${
-                              isDarkMode
-                                ? "bg-slate-900 text-slate-400"
-                                : "bg-slate-100 text-slate-600"
-                            }`}
-                          >
-                            <tr>
-                              <th className="p-1.5">Iterasi</th>
-                              <th className="p-1.5">Fase Pencarian</th>
-                              <th className="p-1.5">Jarak Terbaik</th>
-                              <th className="p-1.5">Delta</th>
-                            </tr>
-                          </thead>
-                          <tbody
-                            className={`divide-y ${
-                              isDarkMode
-                                ? "divide-slate-800"
-                                : "divide-slate-200"
-                            }`}
-                          >
-                            {(activeResult.history || []).map((item, idx, arr) => {
-                              const prevFit =
-                                idx > 0 ? arr[idx - 1].fitness : item.fitness;
-                              const diff = Number(
-                                (item.fitness - prevFit).toFixed(2),
-                              );
-                              return (
-                                <tr key={item.generation}>
-                                  <td className="p-1.5 font-mono font-bold">
-                                    Gen #{item.generation}
-                                  </td>
-                                  <td className="p-1.5 opacity-80">
-                                    {item.phase ||
-                                      (item.generation <=
-                                      Math.floor(params.generations * 0.6)
-                                        ? "GA Exploration"
-                                        : "ABC Exploitation")}
-                                  </td>
-                                  <td className="p-1.5 font-bold text-indigo-500">
-                                    {item.fitness} km
-                                  </td>
-                                  <td className="p-1.5 font-semibold">
-                                    {diff < 0 ? (
-                                      <span className="text-emerald-500">
-                                        {diff} km
-                                      </span>
-                                    ) : (
-                                      <span className="opacity-45">0.00 km</span>
-                                    )}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex-1 min-h-0 w-full">
-                      <FitnessChart
-                        historyData={activeResult ? activeResult.history : []}
-                        isDarkMode={isDarkMode}
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
+            {/* Kolom Kanan Panel Bawah: Grafik Konvergensi / Tabel Benchmark / Log Iterasi */}
+            <div className="w-full md:w-7/12 h-64 md:h-full flex flex-col min-h-0 overflow-hidden">
+              {renderAnalyticsContent(false)}
             </div>
           </div>
         </div>
@@ -1086,7 +1496,7 @@ export default function App() {
                 <option value="BENCHMARK">Benchmark Semua Algoritma</option>
               </select>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px]">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 text-[10px]">
                 {[
                   { key: "capacity", label: "Kapasitas", minVal: 1 },
                   { key: "vehicles", label: "Armada", minVal: 1 },
@@ -1126,6 +1536,37 @@ export default function App() {
                   </div>
                 ))}
               </div>
+
+              {/* Checkbox Pengunci Hasil Acak */}
+              <label
+                className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg border cursor-pointer select-none transition ${
+                  params.seed !== ""
+                    ? isDarkMode
+                      ? "bg-indigo-950/50 border-indigo-700/80 text-indigo-300"
+                      : "bg-indigo-50 border-indigo-200 text-indigo-700"
+                    : isDarkMode
+                      ? "bg-slate-900/70 border-slate-700/80 text-slate-400"
+                      : "bg-slate-50 border-slate-200 text-slate-600"
+                }`}
+              >
+                <span className="flex items-center gap-2 text-[11px] font-semibold">
+                  <input
+                    type="checkbox"
+                    checked={params.seed !== ""}
+                    onChange={(e) =>
+                      updateParams({
+                        ...params,
+                        seed: e.target.checked ? 42 : "",
+                      })
+                    }
+                    className="rounded accent-indigo-600 w-3.5 h-3.5 cursor-pointer"
+                  />
+                  <span>Kunci hasil optimasi (Konsisten)</span>
+                </span>
+                <span className="text-[10px] font-bold opacity-75">
+                  {params.seed !== "" ? "Terkunci" : "Acak"}
+                </span>
+              </label>
             </div>
           </div>
 
@@ -1226,14 +1667,14 @@ export default function App() {
               </h2>
               <div className="flex items-center gap-2.5">
                 <button
-                  onClick={() => updateLocations(defaultLocations)}
+                  onClick={() => updateLocations(defaultLocations, true)}
                   className="text-[11px] text-indigo-500 hover:underline font-bold flex items-center gap-0.5 cursor-pointer"
                 >
                   <i className="ti ti-rotate-clockwise text-xs"></i>
                   <span>Default</span>
                 </button>
                 <button
-                  onClick={() => updateLocations([])}
+                  onClick={() => updateLocations([], false)}
                   className="text-[11px] text-rose-500 hover:underline font-bold flex items-center gap-0.5 cursor-pointer"
                 >
                   <i className="ti ti-trash text-xs"></i>
@@ -1252,97 +1693,113 @@ export default function App() {
                   Belum ada lokasi. Ketuk peta atau tambahkan manual.
                 </div>
               ) : (
-                locations.map((loc) => (
-                  <div
-                    key={loc.id}
-                    className={`p-2 rounded-lg border flex justify-between items-center gap-2 transition ${
-                      loc.isDepot
-                        ? isDarkMode
-                          ? "bg-rose-950/35 border-rose-800/80"
-                          : "bg-rose-50/90 border-rose-200"
-                        : isDarkMode
-                          ? "bg-slate-900/90 border-slate-700/80"
-                          : "bg-slate-50 border-slate-200/70"
-                    }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="font-bold flex items-center gap-1.5 truncate text-xs">
-                        <i
-                          className={`ti ${
-                            loc.isDepot
-                              ? "ti-building-warehouse text-rose-500"
-                              : "ti-map-pin text-indigo-500"
-                          } text-sm shrink-0`}
-                        ></i>
-                        <span
-                          className={`truncate ${
-                            loc.isDepot ? "text-rose-500" : "opacity-95"
-                          }`}
-                        >
-                          {loc.name}
-                        </span>
-                        {loc.isDepot && (
-                          <span className="bg-rose-600 text-white text-[9px] px-1.5 py-0.5 rounded font-extrabold shrink-0">
-                            DEPOT
+                locations.map((loc) => {
+                  const isOversized =
+                    !loc.isDepot && (loc.demand || 0) > params.capacity;
+                  return (
+                    <div
+                      key={loc.id}
+                      className={`p-2 rounded-lg border flex justify-between items-center gap-2 transition ${
+                        loc.isDepot
+                          ? isDarkMode
+                            ? "bg-rose-950/35 border-rose-800/80"
+                            : "bg-rose-50/90 border-rose-200"
+                          : isOversized
+                            ? isDarkMode
+                              ? "bg-amber-950/40 border-amber-700/80"
+                              : "bg-amber-50 border-amber-300"
+                            : isDarkMode
+                              ? "bg-slate-900/90 border-slate-700/80"
+                              : "bg-slate-50 border-slate-200/70"
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold flex items-center gap-1.5 truncate text-xs">
+                          <i
+                            className={`ti ${
+                              loc.isDepot
+                                ? "ti-building-warehouse text-rose-500"
+                                : isOversized
+                                  ? "ti-alert-triangle text-amber-500"
+                                  : "ti-map-pin text-indigo-500"
+                            } text-sm shrink-0`}
+                          ></i>
+                          <span
+                            className={`truncate ${
+                              loc.isDepot ? "text-rose-500" : "opacity-95"
+                            }`}
+                          >
+                            {loc.name}
                           </span>
-                        )}
+                          {loc.isDepot && (
+                            <span className="bg-rose-600 text-white text-[9px] px-1.5 py-0.5 rounded font-extrabold shrink-0">
+                              DEPOT
+                            </span>
+                          )}
+                          {isOversized && (
+                            <span className="bg-amber-500 text-slate-950 text-[9px] px-1.5 py-0.5 rounded font-extrabold shrink-0">
+                              &gt; KAP
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[10px] opacity-60 truncate mt-0.5 pl-5">
+                          {loc.isDepot
+                            ? "Pusat Distribusi"
+                            : `Demand: ${loc.demand} unit`}{" "}
+                          • ({loc.lat.toFixed(4)}, {loc.lng.toFixed(4)})
+                        </div>
                       </div>
-                      <div className="text-[10px] opacity-60 truncate mt-0.5 pl-5">
-                        {loc.isDepot
-                          ? "Pusat Distribusi"
-                          : `Demand: ${loc.demand} unit`}{" "}
-                        - ({loc.lat.toFixed(4)}, {loc.lng.toFixed(4)})
-                      </div>
-                    </div>
 
-                    <div className="flex items-center gap-1 shrink-0">
-                      {!loc.isDepot && (
+                      <div className="flex items-center gap-1 shrink-0">
+                        {!loc.isDepot && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleSetDepot(loc.id);
+                            }}
+                            title="Jadikan Depot"
+                            className={`px-2 py-1.5 lg:py-1 rounded-md text-[10px] font-bold transition cursor-pointer ${
+                              isDarkMode
+                                ? "bg-rose-950 text-rose-300 hover:bg-rose-900"
+                                : "bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            }`}
+                          >
+                            Depot
+                          </button>
+                        )}
+
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleSetDepot(loc.id);
+                            setEditingLoc(loc);
                           }}
-                          title="Jadikan Depot"
-                          className={`px-2 py-1.5 lg:py-1 rounded-md text-[10px] font-bold transition cursor-pointer ${
+                          title="Edit Lokasi"
+                          className={`p-1.5 lg:p-1 rounded-md text-xs transition cursor-pointer ${
                             isDarkMode
-                              ? "bg-rose-950 text-rose-300 hover:bg-rose-900"
-                              : "bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              ? "bg-slate-700 text-slate-200 hover:bg-slate-600"
+                              : "bg-slate-200 text-slate-700 hover:bg-slate-300"
                           }`}
                         >
-                          Depot
+                          <i className="ti ti-pencil text-xs"></i>
                         </button>
-                      )}
 
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setEditingLoc(loc);
-                        }}
-                        title="Edit Lokasi"
-                        className={`p-1.5 lg:p-1 rounded-md text-xs transition cursor-pointer ${
-                          isDarkMode
-                            ? "bg-slate-700 text-slate-200 hover:bg-slate-600"
-                            : "bg-slate-200 text-slate-700 hover:bg-slate-300"
-                        }`}
-                      >
-                        <i className="ti ti-pencil text-xs"></i>
-                      </button>
-
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          updateLocations(
-                            locations.filter((l) => l.id !== loc.id),
-                          );
-                        }}
-                        className="text-rose-500 hover:bg-rose-500/10 rounded-md p-1.5 lg:p-1 transition cursor-pointer"
-                        title="Hapus lokasi"
-                      >
-                        <i className="ti ti-x text-xs"></i>
-                      </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            updateLocations(
+                              locations.filter((l) => l.id !== loc.id),
+                              false,
+                            );
+                          }}
+                          className="text-rose-500 hover:bg-rose-500/10 rounded-md p-1.5 lg:p-1 transition cursor-pointer"
+                          title="Hapus lokasi"
+                        >
+                          <i className="ti ti-x text-xs"></i>
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
@@ -1361,11 +1818,12 @@ export default function App() {
           <div className="opacity-60">Total Muatan / Kapasitas</div>
           <div
             className={`font-extrabold ${
-              isCapacityEnough ? "text-emerald-500" : "text-rose-500"
+              feasibilityInfo.isFeasible ? "text-emerald-500" : "text-rose-500"
             }`}
           >
-            {totalCustomerDemand} / {totalFleetCapacity} unit ({params.vehicles}{" "}
-            Armada)
+            {feasibilityInfo.totalCustomerDemand} /{" "}
+            {feasibilityInfo.totalFleetCapacity} unit ({params.vehicles} Armada)
+            {!feasibilityInfo.isFeasible && " • Tidak Feasible"}
           </div>
         </div>
 
@@ -1386,10 +1844,12 @@ export default function App() {
       {/* Modal Proses Kalkulasi Interaktif */}
       <CalculationOverlay
         isCalculating={isCalculating}
+        onCancel={cancelSolver}
         algorithm={algorithm}
         params={params}
         locationCount={locations.length}
         isDarkMode={isDarkMode}
+        error={error}
       />
 
       {/* Modal Edit Pop-up */}
@@ -1405,7 +1865,7 @@ export default function App() {
               </h3>
               <button
                 onClick={() => setEditingLoc(null)}
-                className="opacity-60 hover:opacity-100 p-1"
+                className="opacity-60 hover:opacity-100 p-1 cursor-pointer"
               >
                 <i className="ti ti-x text-sm"></i>
               </button>
@@ -1488,7 +1948,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setEditingLoc(null)}
-                  className={`px-3.5 py-2 rounded-lg font-semibold ${
+                  className={`px-3.5 py-2 rounded-lg font-semibold cursor-pointer ${
                     isDarkMode
                       ? "bg-slate-700 text-slate-300 hover:bg-slate-600"
                       : "bg-slate-200 text-slate-700 hover:bg-slate-300"
@@ -1498,7 +1958,7 @@ export default function App() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-indigo-600 text-white font-bold hover:bg-indigo-700 flex items-center gap-1"
+                  className="px-4 py-2 rounded-lg bg-indigo-600 text-white font-bold hover:bg-indigo-700 flex items-center gap-1 cursor-pointer"
                 >
                   <i className="ti ti-device-floppy text-sm"></i>
                   <span>Simpan</span>

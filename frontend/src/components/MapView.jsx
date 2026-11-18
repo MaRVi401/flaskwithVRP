@@ -79,8 +79,8 @@ function MapEventsHandler({ onMapClick }) {
   return null;
 }
 
-// Auto-fit zoom saat dataset berubah / di-import
-function MapBoundsUpdater({ locations }) {
+// Auto-fit zoom HANYA saat fitTrigger berubah (dataset awal, load API, import file, reset default)
+function MapBoundsUpdater({ locations, fitTrigger }) {
   const map = useMap();
 
   useEffect(() => {
@@ -91,27 +91,40 @@ function MapBoundsUpdater({ locations }) {
     }
     const bounds = L.latLngBounds(locations.map((l) => [l.lat, l.lng]));
     map.fitBounds(bounds, { padding: [36, 36], maxZoom: 13 });
-  }, [locations, map]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitTrigger, map]);
 
   return null;
 }
 
-export default function MapView({ locations, routes, onMapClick }) {
+function MapView({ locations, routes, onMapClick, fitTrigger, isDarkMode }) {
   const depot = locations.find((l) => l.isDepot) || locations[0];
   const center = depot ? [depot.lat, depot.lng] : [-6.3265, 108.32];
 
   return (
     <div className="relative w-full h-full">
+      {/* Filter gelap halus pada tile OSM saat dark mode agar nyaman di mata */}
+      {isDarkMode && (
+        <style>{`
+          .vrp-dark-map .leaflet-tile-pane {
+            filter: invert(100%) hue-rotate(180deg) brightness(92%) contrast(88%);
+          }
+        `}</style>
+      )}
+
       <MapContainer
         center={center}
         zoom={11}
         attributionControl={false}
-        className="w-full h-full rounded-lg"
+        className={`w-full h-full rounded-lg ${isDarkMode ? "vrp-dark-map" : ""}`}
       >
-        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <TileLayer
+          url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        />
 
         <MapEventsHandler onMapClick={onMapClick} />
-        <MapBoundsUpdater locations={locations} />
+        <MapBoundsUpdater locations={locations} fitTrigger={fitTrigger} />
 
         {/* Render Markers */}
         {locations.map((loc) => (
@@ -170,3 +183,5 @@ export default function MapView({ locations, routes, onMapClick }) {
     </div>
   );
 }
+
+export default React.memo(MapView);
