@@ -1,14 +1,67 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
 
 export function useVrpSolver() {
   const [isCalculating, setIsCalculating] = useState(false);
+  const [isLoadingDataset, setIsLoadingDataset] = useState(false);
   const [result, setResult] = useState(null);
   const [benchmarkResult, setBenchmarkResult] = useState(null);
   const [error, setError] = useState(null);
+  const abortControllerRef = useRef(null);
+
+  const loadDatasetFromApi = useCallback(async () => {
+    setIsLoadingDataset(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/dataset`);
+      const rawData = await response.json();
+
+      if (!response.ok || !Array.isArray(rawData)) {
+        throw new Error(rawData?.message || 'Gagal memuat dataset dari server Flask');
+      }
+
+      let depotAssigned = false;
+      const formatted = rawData
+        .filter((item) => !isNaN(parseFloat(item.lat)) && !isNaN(parseFloat(item.lng)))
+        .map((item, idx) => {
+          const isDepotFlag = Boolean(item.isDepot) && !depotAssigned;
+          if (isDepotFlag) depotAssigned = true;
+
+          return {
+            id: item.id || `api-loc-${idx}-${Date.now()}`,
+            name: String(item.name || `Lokasi ${idx + 1}`),
+            lat: parseFloat(item.lat),
+            lng: parseFloat(item.lng),
+            demand: isDepotFlag ? 0 : Math.max(0, parseInt(item.demand, 10) || 0),
+            isDepot: isDepotFlag,
+          };
+        });
+
+      if (formatted.length > 0 && !depotAssigned) {
+        formatted[0].isDepot = true;
+        formatted[0].demand = 0;
+      }
+
+      return formatted;
+    } catch (err) {
+      console.error('[useVrpSolver] Error memuat dataset:', err);
+      setError(err.message);
+      alert(`Gagal memuat dataset dari Flask: ${err.message}`);
+      return null;
+    } finally {
+      setIsLoadingDataset(false);
+    }
+  }, []);
 
   const runSolver = useCallback(async (algorithm, locations, params) => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setIsCalculating(true);
     setError(null);
 
@@ -23,6 +76,7 @@ export function useVrpSolver() {
           locations,
           params,
         }),
+        signal: controller.signal,
       });
 
       const payload = await response.json();
@@ -32,10 +86,9 @@ export function useVrpSolver() {
       }
 
       if (payload.isBenchmark) {
-        const benchData = payload.data; // { GA, ABC, HYBRID }
+        const benchData = payload.data;
         setBenchmarkResult(benchData);
 
-        // Tentukan pemenang terbaik (prioritas solusi valid dengan jarak terpendek)
         const entries = Object.entries(benchData);
         entries.sort(([, a], [, b]) => {
           const aValid = a.isFeasible !== false ? 0 : 1;
@@ -59,20 +112,25 @@ export function useVrpSolver() {
 
       return payload;
     } catch (err) {
+      if (err.name === 'AbortError') return null;
       console.error('[useVrpSolver] Error:', err);
       setError(err.message || 'Gagal terhubung ke backend Flask');
       alert(`Gagal memproses optimasi: ${err.message || 'Periksa server Flask'}`);
       return null;
     } finally {
-      setIsCalculating(false);
+      if (abortControllerRef.current === controller) {
+        setIsCalculating(false);
+      }
     }
   }, []);
 
   return {
     isCalculating,
+    isLoadingDataset,
     result,
     benchmarkResult,
     runSolver,
+    loadDatasetFromApi,
     error,
   };
 }

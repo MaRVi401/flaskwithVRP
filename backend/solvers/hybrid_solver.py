@@ -9,32 +9,40 @@ from solvers.abc_solver import run_abc
 
 
 def apply_intra_route_2opt(routes: list, dist_matrix: list, depot_idx: int) -> list:
+    """1. Intra-Route 2-Opt dengan O(1) Delta Evaluation untuk akselerasi."""
     result_routes = []
     for route in routes:
-        if len(route) < 3:
+        n = len(route)
+        if n < 3:
             result_routes.append(list(route))
             continue
 
         best_route = list(route)
-        best_dist = get_single_route_distance(best_route, dist_matrix, depot_idx)
         improved = True
 
         while improved:
             improved = False
-            for i in range(len(best_route) - 1):
-                for k in range(i + 1, len(best_route)):
-                    candidate = (
-                        best_route[:i]
-                        + list(reversed(best_route[i : k + 1]))
-                        + best_route[k + 1 :]
+            for i in range(n - 1):
+                prev_node = depot_idx if i == 0 else best_route[i - 1]
+                node_i = best_route[i]
+                d_prev_i = dist_matrix[prev_node][node_i]
+
+                for k in range(i + 1, n):
+                    node_k = best_route[k]
+                    next_node = depot_idx if k == n - 1 else best_route[k + 1]
+
+                    old_edges = d_prev_i + dist_matrix[node_k][next_node]
+                    new_edges = (
+                        dist_matrix[prev_node][node_k]
+                        + dist_matrix[node_i][next_node]
                     )
-                    cand_dist = get_single_route_distance(
-                        candidate, dist_matrix, depot_idx
-                    )
-                    if cand_dist + 1e-6 < best_dist:
-                        best_route = candidate
-                        best_dist = cand_dist
+
+                    if new_edges + 1e-6 < old_edges:
+                        best_route[i : k + 1] = reversed(best_route[i : k + 1])
                         improved = True
+                        break
+                if improved:
+                    break
 
         result_routes.append(best_route)
     return result_routes
@@ -47,6 +55,7 @@ def apply_inter_route_optimization(
     locations: list,
     capacity: float,
 ) -> list:
+    """2. Inter-Route Relocate (1-0) + Inter-Route Swap (1-1)."""
     current_routes = [list(r) for r in routes if len(r) > 0]
     improved = True
 
@@ -301,7 +310,8 @@ def run_hybrid(
         polished_abc_routes, dist_matrix, depot_idx, locations, capacity
     )
 
-    candidates = [
+    # Pilih kandidat terbaik mutlak yang tidak melampaui jumlah armada maksimal
+    raw_candidates = [
         {"routes": ga_result["bestRoutes"], "evalRes": ga_result["bestEval"]},
         {"routes": refined_ga_routes, "evalRes": refined_ga_eval},
         {
@@ -312,6 +322,10 @@ def run_hybrid(
         },
         {"routes": polished_abc_routes, "evalRes": polished_abc_eval},
     ]
+    valid_vehicle_candidates = [
+        c for c in raw_candidates if len(c["routes"]) <= vehicles
+    ]
+    candidates = valid_vehicle_candidates if valid_vehicle_candidates else raw_candidates
     candidates.sort(key=lambda x: x["evalRes"]["fitness"])
     winner = candidates[0]
 

@@ -46,86 +46,115 @@ def _timed_run(fn, locations, params, dist_matrix, customer_indices, depot_idx):
 
 @app.route("/api/solve", methods=["POST"])
 def solve_vrp():
-    payload = request.get_json(silent=True) or {}
-    algorithm = str(payload.get("algorithm", "HYBRID")).upper()
-    locations = payload.get("locations", [])
-    params = payload.get("params", {})
+    try:
+        payload = request.get_json(silent=True) or {}
+        algorithm = str(payload.get("algorithm", "HYBRID")).upper()
+        locations = payload.get("locations", [])
+        raw_params = payload.get("params", {})
 
-    if not locations or len(locations) < 2:
-        return jsonify({"status": "ERROR", "message": "Minimal 2 lokasi dibutuhkan"}), 400
-
-    dist_matrix = build_distance_matrix(locations)
-
-    found_depot = next(
-        (idx for idx, loc in enumerate(locations) if loc.get("isDepot")), -1
-    )
-    depot_idx = found_depot if found_depot != -1 else 0
-    customer_indices = [idx for idx in range(len(locations)) if idx != depot_idx]
-
-    if algorithm == "BENCHMARK":
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            fut_ga = executor.submit(
-                _timed_run,
-                run_ga,
-                locations,
-                params,
-                dist_matrix,
-                customer_indices,
-                depot_idx,
-            )
-            fut_abc = executor.submit(
-                _timed_run,
-                run_abc,
-                locations,
-                params,
-                dist_matrix,
-                customer_indices,
-                depot_idx,
-            )
-            fut_hybrid = executor.submit(
-                _timed_run,
-                run_hybrid,
-                locations,
-                params,
-                dist_matrix,
-                customer_indices,
-                depot_idx,
+        if not isinstance(locations, list) or len(locations) < 2:
+            return (
+                jsonify(
+                    {
+                        "status": "ERROR",
+                        "message": "Minimal 2 lokasi (1 Depot dan 1 Pelanggan) dibutuhkan.",
+                    }
+                ),
+                400,
             )
 
-            ga_data = fut_ga.result()
-            abc_data = fut_abc.result()
-            hybrid_data = fut_hybrid.result()
+        params = {
+            "capacity": max(1.0, float(raw_params.get("capacity", 35))),
+            "vehicles": max(1, int(raw_params.get("vehicles", 3))),
+            "generations": max(1, int(raw_params.get("generations", 100))),
+            "popSize": max(2, int(raw_params.get("popSize", 40))),
+        }
+
+        dist_matrix = build_distance_matrix(locations)
+
+        found_depot = next(
+            (idx for idx, loc in enumerate(locations) if loc.get("isDepot")), -1
+        )
+        depot_idx = found_depot if found_depot != -1 else 0
+        customer_indices = [idx for idx in range(len(locations)) if idx != depot_idx]
+
+        if not customer_indices:
+            return (
+                jsonify(
+                    {"status": "ERROR", "message": "Minimal 1 titik pelanggan dibutuhkan."}
+                ),
+                400,
+            )
+
+        if algorithm == "BENCHMARK":
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                fut_ga = executor.submit(
+                    _timed_run,
+                    run_ga,
+                    locations,
+                    params,
+                    dist_matrix,
+                    customer_indices,
+                    depot_idx,
+                )
+                fut_abc = executor.submit(
+                    _timed_run,
+                    run_abc,
+                    locations,
+                    params,
+                    dist_matrix,
+                    customer_indices,
+                    depot_idx,
+                )
+                fut_hybrid = executor.submit(
+                    _timed_run,
+                    run_hybrid,
+                    locations,
+                    params,
+                    dist_matrix,
+                    customer_indices,
+                    depot_idx,
+                )
+
+                ga_data = fut_ga.result()
+                abc_data = fut_abc.result()
+                hybrid_data = fut_hybrid.result()
+
+            return jsonify(
+                {
+                    "status": "SUCCESS",
+                    "isBenchmark": True,
+                    "data": {
+                        "GA": ga_data,
+                        "ABC": abc_data,
+                        "HYBRID": hybrid_data,
+                    },
+                }
+            )
+
+        solver_map = {
+            "GA": run_ga,
+            "ABC": run_abc,
+            "HYBRID": run_hybrid,
+        }
+        solver_fn = solver_map.get(algorithm, run_hybrid)
+        result_data = _timed_run(
+            solver_fn, locations, params, dist_matrix, customer_indices, depot_idx
+        )
 
         return jsonify(
             {
                 "status": "SUCCESS",
-                "isBenchmark": True,
-                "data": {
-                    "GA": ga_data,
-                    "ABC": abc_data,
-                    "HYBRID": hybrid_data,
-                },
+                "isBenchmark": False,
+                "algorithm": algorithm,
+                "data": result_data,
             }
         )
 
-    solver_map = {
-        "GA": run_ga,
-        "ABC": run_abc,
-        "HYBRID": run_hybrid,
-    }
-    solver_fn = solver_map.get(algorithm, run_hybrid)
-    result_data = _timed_run(
-        solver_fn, locations, params, dist_matrix, customer_indices, depot_idx
-    )
-
-    return jsonify(
-        {
-            "status": "SUCCESS",
-            "isBenchmark": False,
-            "algorithm": algorithm,
-            "data": result_data,
-        }
-    )
+    except (ValueError, TypeError) as err:
+        return jsonify({"status": "ERROR", "message": f"Parameter tidak valid: {err}"}), 400
+    except Exception as err:
+        return jsonify({"status": "ERROR", "message": f"Server error: {str(err)}"}), 500
 
 
 if __name__ == "__main__":
