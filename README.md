@@ -127,15 +127,6 @@ Aplikasi web dapat diakses melalui browser di **`http://localhost:5173`**.
 
 ---
 
-## ⚙️ Konfigurasi Environment Variable (Opsional)
-
-### Frontend (`frontend/.env`)
-
-```env
-VITE_API_URL=http://localhost:5000/api
-
-```
-
 ### Backend (Environment Variables)
 
 | Variabel | Default | Keterangan |
